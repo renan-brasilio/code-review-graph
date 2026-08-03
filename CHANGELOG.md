@@ -21,9 +21,17 @@
   return `managed_package_namespace` + a strk-mcp suggestion instead of a
   bare "not found" for `sitetracker__`/`strk__`-namespaced symbols), semantic
   search coverage for `Field`/`SalesforceFlow`/`Object` nodes (previously
-  invisible to `embed`, since they have no `File` node counterpart), MCP
+  invisible to `embed`, since they have no `File` node counterpart),
+  **`lwc_apex_resolver`** for LWC/Aura `@salesforce/apex`/`@salesforce/schema`
+  imports (resolves the bare-string `IMPORTS_FROM` target plus same-file
+  `CALLS`/`REFERENCES` edges to the real Apex method/Field node — previously
+  `callers_of` on an `@AuraEnabled` method found zero LWC/Aura callers), MCP
   **`serve --repo`** on install, and eval config `salesforce-apex-fixture`.
   See docs/SALESFORCE.md.
+- Fixed `code-review-graph update` never re-running Salesforce metadata
+  indexing on a Flow-XML-only change (it checked for `*.field-meta.xml`
+  changes but not `*.flow-meta.xml`); a full `build` was the only way to
+  pick up Flow edits.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

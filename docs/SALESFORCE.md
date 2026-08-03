@@ -65,6 +65,7 @@ include_formulas = true
 | Field formula lookup | `semantic_search_nodes` | Query field API name |
 | What Apex does a Salesforce Flow invoke? | `query_graph` | `callees_of` on the flow's qualified name, or filter `INVOKES` edges |
 | What object does a Flow act on? | `query_graph` | `REFERENCES` edges from the flow |
+| What LWC/Aura components call this Apex method? | `query_graph` | `callers_of` on the method — resolves `@salesforce/apex` imports automatically |
 
 **Tips:**
 
@@ -86,6 +87,7 @@ include_formulas = true
 | `apex_trigger_resolver` | `createAndExecuteHandler(Handler.class)` in triggers | `INVOKES` edge to handler class |
 | `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal + `BELONGS_TO` edge to an `Object` node |
 | `metadata_indexer` | `*.flow-meta.xml` | `SalesforceFlow` node (process type, trigger, step summary in `extra`) + `INVOKES` edges to Apex classes (`actionCalls`) and subflows + `REFERENCES` edges to objects touched |
+| `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` imports in LWC/Aura `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
 
 `Object` nodes are minimal stubs (name only) unless/until full
 `.object-meta.xml` parsing is added — this deliberately covers objects with
@@ -123,6 +125,9 @@ Uses the sample trigger/handler fixture under `tests/fixtures/apex/acceptance_pa
   a compact summary in `extra["steps"]`, not a fully exploded per-element
   graph. Decision branch logic (which rule leads where) isn't distinguished.
 - No permission sets, profiles, layouts, or custom metadata type records
+- LWC/Aura resolution covers the standard `import x from '@salesforce/apex/...'`
+  / `'@salesforce/schema/...'` default-import form only (the only form
+  Salesforce's own framework allows for these two module families)
 - `Object` nodes are stubs (name only) until full `.object-meta.xml`
   parsing is added
 - No cross-org / deployed metadata

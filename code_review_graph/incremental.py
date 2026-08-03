@@ -184,6 +184,16 @@ def _run_metadata_indexer(store: GraphStore, repo_root: Path) -> Optional[dict]:
         logger.warning("Salesforce metadata indexer failed: %s", exc)
         return None
 
+
+def _run_lwc_apex_resolver(store: GraphStore) -> Optional[dict]:
+    """Resolve LWC/Aura @salesforce/apex and @salesforce/schema imports."""
+    try:
+        from .lwc_apex_resolver import resolve_lwc_apex_imports
+        return resolve_lwc_apex_imports(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("LWC/Apex resolver failed: %s", exc)
+        return None
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
@@ -1198,6 +1208,7 @@ def full_build(
     apex_static_stats = _run_apex_static_resolver(store)
     apex_trigger_stats = _run_apex_trigger_resolver(store)
     metadata_stats = _run_metadata_indexer(store, repo_root)
+    lwc_apex_stats = _run_lwc_apex_resolver(store)
 
     return {
         "files_parsed": len(files),
@@ -1213,6 +1224,7 @@ def full_build(
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
         "apex_static_resolution": apex_static_stats,
+        "lwc_apex_resolution": lwc_apex_stats,
         "apex_trigger_resolution": apex_trigger_stats,
         "metadata_indexing": metadata_stats,
     }
@@ -1401,12 +1413,18 @@ def incremental_update(
     apex_trigger_stats = _run_apex_trigger_resolver(store) if apex_changed else None
 
     metadata_changed = any(
-        "objects/" in rp.replace("\\", "/") and rp.endswith(".field-meta.xml")
-        for rp in all_files
+        rp.endswith((".field-meta.xml", ".flow-meta.xml")) for rp in all_files
     ) or apex_changed
     metadata_stats = (
         _run_metadata_indexer(store, repo_root) if metadata_changed else None
     )
+
+    lwc_changed = (
+        apex_changed
+        or metadata_changed
+        or any(rp.endswith((".js", ".ts")) for rp in all_files)
+    )
+    lwc_apex_stats = _run_lwc_apex_resolver(store) if lwc_changed else None
 
     return {
         "files_updated": files_updated,
@@ -1426,6 +1444,7 @@ def incremental_update(
         "apex_static_resolution": apex_static_stats,
         "apex_trigger_resolution": apex_trigger_stats,
         "metadata_indexing": metadata_stats,
+        "lwc_apex_resolution": lwc_apex_stats,
     }
 
 
