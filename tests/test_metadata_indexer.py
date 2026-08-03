@@ -221,3 +221,83 @@ class TestFlowIndexer:
         stats = index_salesforce_metadata(store, tmp_path)
         assert stats["flow_invokes_unresolved"] == 1
         store.close()
+
+
+class TestStaleMetadataFileCleanup:
+    """A deleted *.field-meta.xml/*.flow-meta.xml/CustomLabels.labels-meta.xml
+    has no configured Tree-sitter language, so the general stale-file
+    reconciliation in incremental.py never sees it — metadata_indexer must
+    clean these up itself or a full rebuild leaves a permanent phantom node."""
+
+    def test_deleted_field_file_is_removed_on_next_index_run(self, tmp_path):
+        objects_dir = (
+            tmp_path / "force-app" / "main" / "default" / "objects"
+            / "Sample_Record_Link__c" / "fields"
+        )
+        objects_dir.mkdir(parents=True)
+        field_file = objects_dir / "Record_Identifier_Key__c.field-meta.xml"
+        shutil.copy(
+            FIXTURE / "objects" / "Sample_Record_Link__c" / "fields"
+            / "Record_Identifier_Key__c.field-meta.xml",
+            field_file,
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["fields_indexed"] == 1
+        assert stats["stale_metadata_files_removed"] == 0
+
+        field_file.unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["fields_indexed"] == 0
+        assert stats["stale_metadata_files_removed"] == 1
+
+        remaining = store._conn.execute("SELECT name FROM nodes WHERE kind='Field'").fetchall()
+        assert remaining == []
+        store.close()
+
+    def test_deleted_flow_file_is_removed_on_next_index_run(self, tmp_path):
+        flows_dir = tmp_path / "force-app" / "main" / "default" / "flows"
+        flows_dir.mkdir(parents=True)
+        flow_file = flows_dir / "Sample_Record_After_Save.flow-meta.xml"
+        shutil.copy(
+            FIXTURE / "flows" / "Sample_Record_After_Save.flow-meta.xml", flow_file,
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["flows_indexed"] == 1
+
+        flow_file.unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["flows_indexed"] == 0
+        assert stats["stale_metadata_files_removed"] == 1
+
+        remaining = store._conn.execute(
+            "SELECT name FROM nodes WHERE kind='SalesforceFlow'"
+        ).fetchall()
+        assert remaining == []
+        store.close()
+
+    def test_unrelated_field_files_survive_a_sibling_deletion(self, tmp_path):
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        objects_dir.mkdir(parents=True)
+        _copy_object("Sample_Record_Link__c", objects_dir)
+        _copy_object("Sample_Record_Template__c", objects_dir)
+
+        store = GraphStore(get_db_path(tmp_path))
+        index_salesforce_metadata(store, tmp_path)
+
+        (
+            objects_dir / "Sample_Record_Template__c" / "fields"
+            / "Record_Template__c.field-meta.xml"
+        ).unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["stale_metadata_files_removed"] == 1
+
+        remaining = {
+            row["name"]
+            for row in store._conn.execute("SELECT name FROM nodes WHERE kind='Field'").fetchall()
+        }
+        assert remaining == {"Record_Identifier_Key__c", "Sample_Record_Link_Template__c"}
+        store.close()

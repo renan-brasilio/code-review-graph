@@ -59,6 +59,15 @@
 
 ### Fixed
 
+- Fixed a phantom-node bug: deleting a `*.field-meta.xml`, `*.flow-meta.xml`,
+  or `CustomLabels.labels-meta.xml` file left its `Field`/`SalesforceFlow`/
+  `Label` node in the graph forever after a full `build` (verified with a
+  reproduction before fixing). These files have no configured Tree-sitter
+  language, so the general stale-file reconciliation never saw them —
+  `metadata_indexer` now diffs its own discovery scan against previously
+  indexed file paths and removes anything no longer present.
+  `code-review-graph update` was unaffected (its git-diff-based change
+  detection already covered deletions).
 - Fixed a `bandit` CI failure introduced by the Salesforce metadata work:
   `xml.etree.ElementTree` usage in `metadata_indexer.py` (B405/B314 — flagged
   as unsafe for untrusted XML, but these are local repo metadata files, same

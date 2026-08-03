@@ -370,6 +370,30 @@ def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
     return found
 
 
+def _remove_stale_metadata_files(store: GraphStore, current_paths: set[str]) -> int:
+    """Remove Field/SalesforceFlow/Label nodes whose source file no longer exists.
+
+    Metadata XML has no configured Tree-sitter language, so the general
+    stale-file reconciliation in ``incremental.py`` (gated on
+    ``parser.detect_language()``) never sees these files — a deleted
+    ``*.field-meta.xml``/``*.flow-meta.xml``/``CustomLabels.labels-meta.xml``
+    would otherwise leave a permanent phantom node behind on every
+    subsequent full ``build``.
+    """
+    stored_paths = {
+        row["file_path"]
+        for row in store._conn.execute(
+            "SELECT DISTINCT file_path FROM nodes "
+            "WHERE kind IN ('Field', 'SalesforceFlow', 'Label')"
+        ).fetchall()
+    }
+    stale = stored_paths - current_paths
+    if not stale:
+        return 0
+    store.remove_files_permanently(list(stale))
+    return len(stale)
+
+
 def _index_fields(
     store: GraphStore,
     field_files: list[Path],
@@ -591,6 +615,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         "fields_indexed": 0, "references_created": 0, "references_unresolved": 0,
         "flows_indexed": 0, "flow_invokes_created": 0, "flow_invokes_unresolved": 0,
         "flow_references_created": 0, "objects_indexed": 0, "labels_indexed": 0,
+        "stale_metadata_files_removed": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -603,6 +628,9 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     field_files = _discover(paths, repo_root, "*.field-meta.xml")
     flow_files = _discover(paths, repo_root, "*.flow-meta.xml")
     label_files = _discover(paths, repo_root, "CustomLabels.labels-meta.xml")
+
+    current_paths = {str(p) for p in (*field_files, *flow_files, *label_files)}
+    stale_removed = _remove_stale_metadata_files(store, current_paths)
 
     field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
     flow_stats = _index_flows(store, flow_files, object_stub_seen)
@@ -617,10 +645,10 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
 
     logger.info(
         "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object stub(s), "
-        "%d field reference edge(s) (%d unresolved), "
+        "%d stale file(s) removed, %d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
         field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
-        len(object_stub_seen),
+        len(object_stub_seen), stale_removed,
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],
@@ -630,4 +658,5 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         **flow_stats,
         **label_stats,
         "objects_indexed": len(object_stub_seen),
+        "stale_metadata_files_removed": stale_removed,
     }
