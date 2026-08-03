@@ -38,7 +38,11 @@ When `embeddings_count` is 0, `list_graph_stats` suggests running embed.
 
 ### 4. Optional: field formula metadata (Phase 6)
 
-Create `.code-review-graph/metadata.toml`:
+Metadata indexing runs automatically: it reads `packageDirectories` from
+`sfdx-project.json` when present (so non-`force-app` package layouts are
+covered), falling back to `force-app/` if there's no `sfdx-project.json`.
+To override the search paths explicitly, create
+`.code-review-graph/metadata.toml`:
 
 ```toml
 [metadata]
@@ -46,9 +50,6 @@ enabled = true
 paths = ["force-app/main/default/objects"]
 include_formulas = true
 ```
-
-Metadata indexing runs automatically when `force-app/` exists even without this
-file.
 
 ## Agent query recipes
 
@@ -72,7 +73,7 @@ file.
 |----------|-------|--------|
 | `apex_static_resolver` | `Class.method()` CALLS with bare class target | Qualified method target |
 | `apex_trigger_resolver` | `createAndExecuteHandler(Handler.class)` in triggers | `INVOKES` edge to handler class |
-| `metadata_indexer` | `*.field-meta.xml` | `Field` nodes + formula in `extra` |
+| `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal |
 
 ## Probe Apex AST locally
 

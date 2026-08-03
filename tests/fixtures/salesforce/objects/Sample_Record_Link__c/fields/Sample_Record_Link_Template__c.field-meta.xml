@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Sample_Record_Link_Template__c</fullName>
+    <type>Lookup</type>
+    <referenceTo>Sample_Record_Template__c</referenceTo>
+    <relationshipName>Sample_Record_Link_Template</relationshipName>
+</CustomField>

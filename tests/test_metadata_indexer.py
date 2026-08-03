@@ -1,5 +1,6 @@
 """Tests for Salesforce metadata indexer (Phase 6)."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -9,6 +10,12 @@ from code_review_graph.metadata_indexer import index_salesforce_metadata
 from code_review_graph.search import hybrid_search
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "salesforce"
+
+
+def _copy_object(fixture_object: str, dest_objects_dir: Path) -> None:
+    src = FIXTURE / "objects" / fixture_object
+    dest = dest_objects_dir / fixture_object
+    shutil.copytree(src, dest)
 
 
 class TestMetadataIndexer:
@@ -57,4 +64,57 @@ class TestMetadataIndexer:
         hits = hybrid_search(store, "Record_Identifier_Key__c", limit=5)
         names = {h.get("name") for h in hits}
         assert "Record_Identifier_Key__c" in names
+        store.close()
+
+    def test_resolves_relationship_and_cross_object_formula_refs(self, tmp_path):
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        objects_dir.mkdir(parents=True)
+        _copy_object("Sample_Record_Link__c", objects_dir)
+        _copy_object("Sample_Record_Template__c", objects_dir)
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["fields_indexed"] == 3
+        assert stats["references_unresolved"] == 0
+
+        node_qns = {
+            row["qualified_name"]
+            for row in store._conn.execute(
+                "SELECT qualified_name FROM nodes WHERE kind='Field'"
+            ).fetchall()
+        }
+        edges = store._conn.execute(
+            "SELECT target_qualified, extra FROM edges WHERE kind='REFERENCES'"
+        ).fetchall()
+        assert len(edges) == 2
+        for row in edges:
+            assert row["target_qualified"] in node_qns, (
+                f"REFERENCES edge target {row['target_qualified']!r} is not a real "
+                "Field node — formula reference resolution regressed"
+            )
+            assert "unresolved_reference" not in (row["extra"] or "")
+
+        lookup_field = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='Field' AND name='Sample_Record_Link_Template__c'"
+        ).fetchone()
+        assert "Sample_Record_Template__c" in lookup_field["extra"]
+        store.close()
+
+    def test_uses_sfdx_project_package_directories(self, tmp_path):
+        pkg_dir = tmp_path / "my-custom-pkg"
+        objects_dir = pkg_dir / "objects" / "Sample_Record_Link__c" / "fields"
+        objects_dir.mkdir(parents=True)
+        shutil.copy(
+            FIXTURE / "objects" / "Sample_Record_Link__c" / "fields"
+            / "Record_Identifier_Key__c.field-meta.xml",
+            objects_dir / "Record_Identifier_Key__c.field-meta.xml",
+        )
+        (tmp_path / "sfdx-project.json").write_text(
+            json.dumps({"packageDirectories": [{"path": "my-custom-pkg", "default": True}]}),
+            encoding="utf-8",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["fields_indexed"] == 1
         store.close()
