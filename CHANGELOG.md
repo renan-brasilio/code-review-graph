@@ -40,6 +40,16 @@
   Previously `references_to` on a Custom Label found nothing at all,
   despite every class following the org's own coding standard (user-
   visible text must go through a Custom Label) depending on one.
+- **Real object metadata**: `objects/X/X.object-meta.xml` upgrades an
+  `Object` node from a name-only stub to real data (label, description,
+  sharing model), without changing the node's identity — existing
+  `BELONGS_TO`/`REFERENCES` edges to it keep resolving whether the object
+  has real metadata or not, in either direction (a stub that gains real
+  metadata, or real metadata whose file later disappears, downgrading back
+  to a stub rather than deleting the node other Fields/Flows may still
+  reference). Custom Metadata Type *definitions*
+  (`objects/X__mdt/X__mdt.object-meta.xml`) use the identical format, so
+  they're covered by the same code path, flagged `is_custom_metadata_type`.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

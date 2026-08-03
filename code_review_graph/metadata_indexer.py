@@ -185,13 +185,14 @@ def _object_qualified_name(object_name: str) -> str:
 def _upsert_object_stub(store: GraphStore, object_name: str, seen: set[str]) -> str:
     """Ensure a minimal ``Object`` node exists for *object_name* and return its qn.
 
-    Full ``.object-meta.xml`` parsing (sharing model, label, etc.) is future
-    work — this only guarantees Field/Flow references to an object never
-    dangle. That matters even for objects with no local ``.object-meta.xml``
-    at all: extending a managed package's object (adding a custom field or
-    a flow that queries it) intentionally does not redeclare the package's
-    own object metadata locally, since that would drift from and conflict
-    with the installed package version.
+    Only creates a *stub* — if ``_index_objects`` already indexed real
+    ``.object-meta.xml`` for this object this run, *seen* already contains
+    it and this is a no-op, so a stub never clobbers real metadata. This
+    still matters for objects with no local ``.object-meta.xml`` at all:
+    extending a managed package's object (adding a custom field or a flow
+    that queries it) intentionally does not redeclare the package's own
+    object metadata locally, since that would drift from and conflict with
+    the installed package version.
     """
     qn = _object_qualified_name(object_name)
     if object_name not in seen:
@@ -208,6 +209,132 @@ def _upsert_object_stub(store: GraphStore, object_name: str, seen: set[str]) -> 
             )
         )
     return qn
+
+
+def _parse_object_meta(path: Path) -> Optional[dict]:
+    """Parse ``objects/ObjectName/ObjectName.object-meta.xml``.
+
+    Custom Metadata Types (``objects/X__mdt/X__mdt.object-meta.xml``) use
+    the exact same format — the ``__mdt`` suffix on the object name is the
+    only marker, so no separate parsing path is needed for CMT *type*
+    definitions (CMT *records* under ``customMetadata/`` are data, not
+    structure, and aren't indexed).
+    """
+    try:
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
+    except ET.ParseError as exc:
+        logger.warning("Malformed object metadata %s: %s", path, exc)
+        return None
+
+    root = tree.getroot()
+    object_name = path.parent.name
+    if not object_name:
+        return None
+
+    label = None
+    description = None
+    sharing_model = None
+    deployment_status = None
+    plural_label = None
+    for child in root:
+        tag = _local(child.tag)
+        if tag == "label" and child.text:
+            label = child.text.strip()
+        elif tag == "description" and child.text:
+            description = child.text.strip()
+        elif tag == "sharingModel" and child.text:
+            sharing_model = child.text.strip()
+        elif tag == "deploymentStatus" and child.text:
+            deployment_status = child.text.strip()
+        elif tag == "pluralLabel" and child.text:
+            plural_label = child.text.strip()
+
+    return {
+        "name": object_name,
+        "file_path": str(path),
+        "label": label,
+        "description": description,
+        "sharing_model": sharing_model,
+        "deployment_status": deployment_status,
+        "plural_label": plural_label,
+        "is_custom_metadata_type": object_name.endswith("__mdt"),
+    }
+
+
+def _index_objects(store: GraphStore, object_files: list[Path]) -> tuple[dict, set[str]]:
+    """Index real ``.object-meta.xml`` files. Returns (stats, object names indexed)."""
+    real_names: set[str] = set()
+    objects_indexed = 0
+    for path in object_files:
+        info = _parse_object_meta(path)
+        if not info:
+            continue
+        extra: dict = {
+            "metadata_type": "Object", "synthesized": False, "source_file": info["file_path"],
+        }
+        if info.get("label"):
+            extra["label"] = info["label"]
+        if info.get("description"):
+            extra["description"] = info["description"]
+        if info.get("sharing_model"):
+            extra["sharing_model"] = info["sharing_model"]
+        if info.get("deployment_status"):
+            extra["deployment_status"] = info["deployment_status"]
+        if info.get("plural_label"):
+            extra["plural_label"] = info["plural_label"]
+        if info["is_custom_metadata_type"]:
+            extra["is_custom_metadata_type"] = True
+
+        store.upsert_node(
+            NodeInfo(
+                kind="Object",
+                name=info["name"],
+                file_path=_OBJECT_STUB_FILE,
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra=extra,
+            )
+        )
+        objects_indexed += 1
+        real_names.add(info["name"])
+
+    return {"objects_indexed": objects_indexed}, real_names
+
+
+def _downgrade_stale_real_objects(store: GraphStore, current_real_names: set[str]) -> int:
+    """Reset Object nodes back to a bare stub when their .object-meta.xml disappears.
+
+    Never deletes the node outright — other Field/Flow references to the
+    same object by name may still be legitimate, so only the "real metadata"
+    extra is cleared, not the node's existence.
+    """
+    conn = store._conn
+    downgraded = 0
+    for row in conn.execute(
+        "SELECT name, extra FROM nodes WHERE kind = 'Object'"
+    ).fetchall():
+        if row["name"] in current_real_names:
+            continue
+        try:
+            extra = json.loads(row["extra"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+        if extra.get("synthesized", True):
+            continue  # already a stub, nothing to downgrade
+        store.upsert_node(
+            NodeInfo(
+                kind="Object",
+                name=row["name"],
+                file_path=_OBJECT_STUB_FILE,
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra={"metadata_type": "Object", "synthesized": True},
+            )
+        )
+        downgraded += 1
+    return downgraded
 
 
 def _target_references(elem: ET.Element) -> list[str]:
@@ -649,6 +776,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         "flows_indexed": 0, "flow_invokes_created": 0, "flow_invokes_unresolved": 0,
         "flow_references_created": 0, "objects_indexed": 0, "labels_indexed": 0,
         "labels_removed": 0, "stale_metadata_files_removed": 0,
+        "real_objects_indexed": 0, "objects_downgraded": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -656,14 +784,22 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
 
     paths = config.get("paths") or list(DEFAULT_METADATA_PATHS)
     include_formulas = config.get("include_formulas", True)
-    object_stub_seen: set[str] = set()
 
     field_files = _discover(paths, repo_root, "*.field-meta.xml")
     flow_files = _discover(paths, repo_root, "*.flow-meta.xml")
     label_files = _discover(paths, repo_root, "CustomLabels.labels-meta.xml")
+    object_files = _discover(paths, repo_root, "*.object-meta.xml")
 
     current_paths = {str(p) for p in (*field_files, *flow_files, *label_files)}
     stale_removed = _remove_stale_metadata_files(store, current_paths)
+
+    # Objects first: real .object-meta.xml (including CMT type definitions,
+    # same format) must land before Field/Flow indexing so their stub
+    # fallback doesn't clobber real data — object_stub_seen pre-seeded with
+    # real names is what makes _upsert_object_stub a no-op for them.
+    real_object_stats, real_object_names = _index_objects(store, object_files)
+    objects_downgraded = _downgrade_stale_real_objects(store, real_object_names)
+    object_stub_seen: set[str] = set(real_object_names)
 
     field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
     flow_stats = _index_flows(store, flow_files, object_stub_seen)
@@ -671,18 +807,20 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
 
     any_indexed = (
         field_stats["fields_indexed"] or flow_stats["flows_indexed"]
-        or label_stats["labels_indexed"]
+        or label_stats["labels_indexed"] or real_object_stats["objects_indexed"]
+        or objects_downgraded
     )
     if any_indexed:
         store.commit()
 
     logger.info(
-        "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object stub(s), "
-        "%d stale file(s) removed, %d stale label(s) removed, "
+        "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object(s) "
+        "(%d real, %d downgraded), %d stale file(s) removed, %d stale label(s) removed, "
         "%d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
         field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
-        len(object_stub_seen), stale_removed, label_stats["labels_removed"],
+        len(object_stub_seen), real_object_stats["objects_indexed"], objects_downgraded,
+        stale_removed, label_stats["labels_removed"],
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],
@@ -692,5 +830,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         **flow_stats,
         **label_stats,
         "objects_indexed": len(object_stub_seen),
+        "real_objects_indexed": real_object_stats["objects_indexed"],
+        "objects_downgraded": objects_downgraded,
         "stale_metadata_files_removed": stale_removed,
     }

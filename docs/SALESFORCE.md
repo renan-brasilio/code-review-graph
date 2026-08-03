@@ -91,12 +91,22 @@ include_formulas = true
 | `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` / `@salesforce/label/c.LabelName` imports in LWC/Aura `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field / Label node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
 | `metadata_indexer` | `labels/CustomLabels.labels-meta.xml` | `Label` node per entry (value, categories, short description in `extra`) |
 | `apex_label_resolver` | `Label.X` field access in Apex `.cls`/`.trigger` | `REFERENCES` edge to the `Label` node, scoped to the enclosing method when one contains the reference |
+| `metadata_indexer` | `objects/X/X.object-meta.xml` | Upgrades the `Object` node from stub to real (label, description, sharing model, `is_custom_metadata_type`) |
 
-`Object` nodes are minimal stubs (name only) unless/until full
-`.object-meta.xml` parsing is added — this deliberately covers objects with
-no local object metadata at all, which is the normal case when extending a
-managed package's object (adding a field or a flow that queries it) without
+`Object` nodes are stubs (name only) unless/until real `.object-meta.xml` is
+found — this deliberately still covers objects with no local object
+metadata at all, which is the normal case when extending a managed
+package's object (adding a field or a flow that queries it) without
 redeclaring metadata that would drift from the installed package version.
+When a stub is later backed by real metadata (or the reverse — the file
+disappears), the node's identity is unchanged, so existing `BELONGS_TO`/
+`REFERENCES` edges to it never dangle either way.
+
+Custom Metadata Type *definitions* (`objects/X__mdt/X__mdt.object-meta.xml`)
+use the exact same format as regular objects, so they're indexed by the
+same path, flagged `is_custom_metadata_type` in `extra`. CMT *records*
+(the configuration data under `customMetadata/`) are data, not code
+structure, and aren't indexed.
 
 Note: the node kind is `SalesforceFlow`, not `Flow` — `flows.py` /
 `get_flow_tool` already use "flow" for a derived concept (execution paths
@@ -127,11 +137,12 @@ Uses the sample trigger/handler fixture under `tests/fixtures/apex/acceptance_pa
 - Flow XML indexing is one node per flow — the internal step sequence is
   a compact summary in `extra["steps"]`, not a fully exploded per-element
   graph. Decision branch logic (which rule leads where) isn't distinguished.
-- No permission sets, profiles, layouts, or custom metadata type records
+- No permission sets, profiles, or layouts yet
+- No CMT *records* (only type definitions — see above)
 - LWC/Aura resolution covers the standard `import x from '@salesforce/apex/...'`
   / `'@salesforce/schema/...'` default-import form only (the only form
   Salesforce's own framework allows for these two module families)
-- `Object` nodes are stubs (name only) until full `.object-meta.xml`
+- `Object` nodes are stubs (name only) until real `.object-meta.xml`
   parsing is added
 - No cross-org / deployed metadata
 - No runtime Apex semantics (governor limits, sharing, etc.)

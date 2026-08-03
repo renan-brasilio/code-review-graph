@@ -342,3 +342,118 @@ class TestStaleMetadataFileCleanup:
         }
         assert remaining == {"Label_A"}
         store.close()
+
+
+OBJECT_META_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Sample Record</label>
+    <pluralLabel>Sample Records</pluralLabel>
+    <description>A sample custom object.</description>
+    <sharingModel>ReadWrite</sharingModel>
+    <deploymentStatus>Deployed</deploymentStatus>
+</CustomObject>
+"""
+
+CMT_OBJECT_META_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Sample Config</label>
+    <pluralLabel>Sample Configs</pluralLabel>
+    <description>A custom metadata type.</description>
+    <deploymentStatus>Deployed</deploymentStatus>
+</CustomObject>
+"""
+
+
+class TestObjectIndexing:
+    def test_indexes_real_object_metadata(self, tmp_path):
+        obj_dir = tmp_path / "force-app" / "main" / "default" / "objects" / "Sample_Record__c"
+        obj_dir.mkdir(parents=True)
+        (obj_dir / "Sample_Record__c.object-meta.xml").write_text(
+            OBJECT_META_XML, encoding="utf-8",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["real_objects_indexed"] == 1
+
+        row = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='Object' AND name='Sample_Record__c'"
+        ).fetchone()
+        assert row is not None
+        assert '"synthesized": false' in row["extra"]
+        assert "Sample Record" in row["extra"]
+        assert "ReadWrite" in row["extra"]
+        store.close()
+
+    def test_custom_metadata_type_uses_same_format_flagged_distinctly(self, tmp_path):
+        obj_dir = (
+            tmp_path / "force-app" / "main" / "default" / "objects" / "Sample_Config__mdt"
+        )
+        obj_dir.mkdir(parents=True)
+        (obj_dir / "Sample_Config__mdt.object-meta.xml").write_text(
+            CMT_OBJECT_META_XML, encoding="utf-8",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["real_objects_indexed"] == 1
+
+        row = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='Object' AND name='Sample_Config__mdt'"
+        ).fetchone()
+        assert '"is_custom_metadata_type": true' in row["extra"]
+        store.close()
+
+    def test_field_stub_upgrades_to_real_object_without_new_node(self, tmp_path):
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        field_dir = objects_dir / "Sample_Record_Link__c" / "fields"
+        field_dir.mkdir(parents=True)
+        shutil.copy(
+            FIXTURE / "objects" / "Sample_Record_Link__c" / "fields"
+            / "Record_Identifier_Key__c.field-meta.xml",
+            field_dir / "Record_Identifier_Key__c.field-meta.xml",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        index_salesforce_metadata(store, tmp_path)
+        stub = store._conn.execute(
+            "SELECT qualified_name, extra FROM nodes WHERE kind='Object' "
+            "AND name='Sample_Record_Link__c'"
+        ).fetchone()
+        assert '"synthesized": true' in stub["extra"]
+
+        obj_dir = objects_dir / "Sample_Record_Link__c"
+        (obj_dir / "Sample_Record_Link__c.object-meta.xml").write_text(
+            OBJECT_META_XML, encoding="utf-8",
+        )
+        index_salesforce_metadata(store, tmp_path)
+        upgraded = store._conn.execute(
+            "SELECT qualified_name, extra FROM nodes WHERE kind='Object' "
+            "AND name='Sample_Record_Link__c'"
+        ).fetchone()
+        assert '"synthesized": false' in upgraded["extra"]
+        # Same node identity — BELONGS_TO/REFERENCES edges created before the
+        # upgrade must still resolve, not dangle.
+        assert upgraded["qualified_name"] == stub["qualified_name"]
+        store.close()
+
+    def test_real_object_downgrades_to_stub_when_metadata_file_removed(self, tmp_path):
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        obj_dir = objects_dir / "Sample_Record__c"
+        obj_dir.mkdir(parents=True)
+        meta_file = obj_dir / "Sample_Record__c.object-meta.xml"
+        meta_file.write_text(OBJECT_META_XML, encoding="utf-8")
+
+        store = GraphStore(get_db_path(tmp_path))
+        index_salesforce_metadata(store, tmp_path)
+
+        meta_file.unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["objects_downgraded"] == 1
+
+        row = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='Object' AND name='Sample_Record__c'"
+        ).fetchone()
+        assert row is not None  # never deleted, only downgraded
+        assert '"synthesized": true' in row["extra"]
+        store.close()
