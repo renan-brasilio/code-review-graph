@@ -8,11 +8,13 @@ Cursor hooks / OpenCode plugin generation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import platform
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -298,11 +300,26 @@ def _in_uv_project() -> bool:
     return False
 
 
+def _dev_checkout_root() -> Path | None:
+    """Return the code-review-graph source checkout root, if known."""
+    env_root = os.environ.get("CRG_DEV_ROOT", "").strip()
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+        if (root / "pyproject.toml").exists():
+            return root
+    pkg_root = Path(__file__).resolve().parent.parent
+    if (pkg_root / "pyproject.toml").exists() and (pkg_root / "uv.lock").exists():
+        return pkg_root
+    return None
+
+
 def _detect_serve_command() -> tuple[str, list[str]]:
     """Return ``(command, args)`` that correctly launches ``code-review-graph serve``.
 
     Detection priority
     ------------------
+    0. **Dev checkout** – ``CRG_DEV_ROOT`` or running from a local uv project checkout
+       → ``uv run --directory <root> code-review-graph serve``
     1. **Poetry** – ``POETRY_ACTIVE=1`` OR ``VIRTUAL_ENV`` contains ``"pypoetry"``
        (covers both ``poetry shell`` and ``poetry run``) and ``poetry`` is on PATH
        → ``poetry run code-review-graph serve``
@@ -318,6 +335,15 @@ def _detect_serve_command() -> tuple[str, list[str]]:
     that is currently running, so it resolves correctly inside any virtual
     environment, conda env, or system installation.
     """
+    dev_root = _dev_checkout_root()
+    if dev_root is not None:
+        uv = shutil.which("uv")
+        if uv:
+            return (
+                "uv",
+                ["run", "--directory", str(dev_root), "code-review-graph", "serve"],
+            )
+
     # 1. Poetry (poetry shell or poetry run)
     if _in_poetry_project():
         poetry = shutil.which("poetry")
@@ -338,6 +364,56 @@ def _detect_serve_command() -> tuple[str, list[str]]:
     return (sys.executable, ["-m", "code_review_graph", "serve"])
 
 
+def _append_serve_repo_args(args: list[str], repo_root: Path) -> list[str]:
+    """Ensure MCP serve args include --repo for the application workspace."""
+    out = list(args)
+    repo_str = str(repo_root.resolve())
+    if "--repo" in out:
+        return out
+    if "serve" in out:
+        idx = len(out) - 1 - out[::-1].index("serve")
+        return out[: idx + 1] + ["--repo", repo_str] + out[idx + 1 :]
+    return out + ["serve", "--repo", repo_str]
+
+
+def _ensure_repo_in_server_entry(
+    entry: dict[str, Any],
+    repo_root: Path,
+) -> tuple[dict[str, Any], bool]:
+    """Merge --repo and CRG_REPO_ROOT into an existing MCP server entry.
+
+    Preserves the existing launch command (e.g. ``uv run --directory <fork>``)
+    and only adds or updates repo-scoping fields.
+    """
+    merged = dict(entry)
+    changed = False
+    repo_str = str(repo_root.resolve())
+
+    args = list(merged.get("args") or [])
+    if "--repo" in args:
+        idx = args.index("--repo")
+        if idx + 1 < len(args) and args[idx + 1] != repo_str:
+            args[idx + 1] = repo_str
+            changed = True
+    else:
+        args = _append_serve_repo_args(args, repo_root)
+        changed = True
+    if merged.get("args") != args:
+        merged["args"] = args
+
+    if merged.get("cwd") != repo_str:
+        merged["cwd"] = repo_str
+        changed = True
+
+    env = dict(merged.get("env") or {})
+    if env.get("CRG_REPO_ROOT") != repo_str:
+        env["CRG_REPO_ROOT"] = repo_str
+        merged["env"] = env
+        changed = True
+
+    return merged, changed
+
+
 def _build_server_entry(
     plat: dict[str, Any], key: str = "", repo_root: "Path | None" = None,
 ) -> dict[str, Any]:
@@ -346,14 +422,17 @@ def _build_server_entry(
     if key == "opencode":
         opencode_command = [command, *args]
         if repo_root is not None:
-            opencode_command.extend(("--repo", str(repo_root)))
+            opencode_command.extend(("--repo", str(repo_root.resolve())))
         return {"type": "local", "command": opencode_command}
 
+    if repo_root is not None:
+        args = _append_serve_repo_args(list(args), repo_root)
     entry: dict[str, Any] = {"command": command, "args": args}
     # Include cwd so the MCP server can find the graph database
     if repo_root is not None:
-        entry["cwd"] = str(repo_root)
-    if plat["needs_type"]:
+        entry["cwd"] = str(repo_root.resolve())
+        entry["env"] = {"CRG_REPO_ROOT": str(repo_root.resolve())}
+    if plat.get("needs_type"):
         entry["type"] = plat.get("server_type", "stdio")
     entry.update(plat.get("entry_fields", {}))
     return entry
@@ -379,6 +458,194 @@ def _warn_legacy_opencode_config(repo_root: Path) -> None:
             "OpenCode now reads opencode.json or opencode.jsonc with a top-level "
             "'mcp' setting."
         )
+def _cursor_string_hash(value: str, seed: int = 0) -> int:
+    """VS Code / Cursor string hash (same algorithm as ``cx()`` in MCPService)."""
+    state = ((seed << 5) - seed + 149417) & 0xFFFFFFFF
+    for char in value:
+        state = ((state << 5) - state + ord(char)) & 0xFFFFFFFF
+    return state
+
+
+def _cursor_mcp_config_hash(server_entry: dict[str, Any]) -> str:
+    """Hash MCP launch config the same way Cursor ``computeServerConfigHash`` does."""
+    fields = ("command", "args", "env", "envFile", "url", "headers")
+    payload = {key: server_entry[key] for key in fields if key in server_entry}
+    serialized = json.dumps(payload, separators=(",", ":"))
+    return format(_cursor_string_hash(serialized), "x")[:16]
+
+
+def _cursor_mcp_identifier(
+    repo_root: Path,
+    server_name: str = "code-review-graph",
+    folder_index: int = 0,
+) -> str:
+    """Return the project-managed MCP identifier Cursor assigns in the UI."""
+    folder_key = f"{folder_index}-{repo_root.name}"
+    return f"project-{folder_key}-{server_name}"
+
+
+def _cursor_mcp_ide_approval_key(
+    repo_root: Path,
+    server_entry: dict[str, Any],
+    server_name: str = "code-review-graph",
+    folder_index: int = 0,
+) -> str:
+    """Approval key stored in Cursor's ``approvedProjectMcpServers`` setting."""
+    identifier = _cursor_mcp_identifier(
+        repo_root, server_name=server_name, folder_index=folder_index,
+    )
+    return f"{identifier}:{_cursor_mcp_config_hash(server_entry)}"
+
+
+def _cursor_mcp_cli_approval_key(
+    repo_root: Path,
+    server_entry: dict[str, Any],
+    server_name: str = "code-review-graph",
+) -> str:
+    """Approval key written for Cursor CLI / agent in ``mcp-approvals.json``."""
+    fields = ("command", "args", "env", "envFile", "url", "headers")
+    server = {key: server_entry[key] for key in fields if key in server_entry}
+    payload = {"path": str(repo_root.resolve()), "server": server}
+    digest = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":")).encode(),
+    ).hexdigest()[:16]
+    return f"{server_name}-{digest}"
+
+
+def _cursor_global_state_db() -> Path | None:
+    """Return Cursor's global ``state.vscdb`` path when Cursor is installed."""
+    system = platform.system()
+    if system == "Darwin":
+        base = Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage"
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            return None
+        base = Path(appdata) / "Cursor" / "User" / "globalStorage"
+    else:
+        base = Path.home() / ".config" / "Cursor" / "User" / "globalStorage"
+    db_path = base / "state.vscdb"
+    return db_path if db_path.exists() else None
+
+
+def _cursor_project_metadata_dir(repo_root: Path) -> Path:
+    """Return ``~/.cursor/projects/<slug>`` for a workspace folder."""
+    slug = str(repo_root.resolve()).replace("/", "-").lstrip("-")
+    return Path.home() / ".cursor" / "projects" / slug
+
+
+def _merge_cursor_ide_approval(db_path: Path, approval_key: str) -> bool:
+    """Append *approval_key* to Cursor's global approved-project MCP list."""
+    storage_key = "cursor/approvedProjectMcpServers"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT value FROM ItemTable WHERE key = ?",
+            (storage_key,),
+        ).fetchone()
+        approvals: list[str] = []
+        if row and row[0]:
+            parsed = json.loads(row[0])
+            if isinstance(parsed, list):
+                approvals = [str(item) for item in parsed]
+        if approval_key in approvals:
+            return False
+        approvals.append(approval_key)
+        encoded = json.dumps(approvals)
+        if row:
+            conn.execute(
+                "UPDATE ItemTable SET value = ? WHERE key = ?",
+                (encoded, storage_key),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                (storage_key, encoded),
+            )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _write_cursor_cli_approvals(
+    repo_root: Path,
+    approval_keys: list[str],
+    dry_run: bool = False,
+) -> Path:
+    """Write CLI/agent MCP approvals beside Cursor's project metadata."""
+    target = _cursor_project_metadata_dir(repo_root) / "mcp-approvals.json"
+    if dry_run:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[str] = []
+    if target.exists():
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(parsed, list):
+                existing = [str(item) for item in parsed]
+        except (json.JSONDecodeError, OSError):
+            existing = []
+    merged = list(dict.fromkeys([*existing, *approval_keys]))
+    target.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    return target
+
+
+def activate_cursor_mcp_server(
+    repo_root: Path,
+    server_entry: dict[str, Any],
+    *,
+    server_name: str = "code-review-graph",
+    folder_index: int = 0,
+    dry_run: bool = False,
+) -> bool:
+    """Mark a project MCP server as approved/active in Cursor.
+
+    Project ``.cursor/mcp.json`` servers start disabled until approved in the
+    UI. ``install`` calls this to whitelist ``code-review-graph`` automatically.
+    """
+    ide_key = _cursor_mcp_ide_approval_key(
+        repo_root,
+        server_entry,
+        server_name=server_name,
+        folder_index=folder_index,
+    )
+    cli_key = _cursor_mcp_cli_approval_key(
+        repo_root, server_entry, server_name=server_name,
+    )
+
+    if dry_run:
+        print(f"  [dry-run] Cursor: would approve MCP server ({ide_key})")
+        return True
+
+    changed = False
+    db_path = _cursor_global_state_db()
+    if db_path is None:
+        print(
+            "  Cursor: wrote MCP config; could not find Cursor state DB "
+            "to auto-enable (open Settings → MCP and enable code-review-graph, "
+            "or restart Cursor after first install).",
+        )
+    else:
+        try:
+            if _merge_cursor_ide_approval(db_path, ide_key):
+                changed = True
+                print(f"  Cursor: enabled MCP server in {db_path.name}")
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning("Could not update Cursor MCP approvals: %s", exc)
+            print(
+                "  Cursor: wrote MCP config but could not auto-enable "
+                f"({exc}). Enable code-review-graph in Settings → MCP.",
+            )
+
+    try:
+        cli_path = _write_cursor_cli_approvals(repo_root, [cli_key])
+        if changed:
+            print(f"  Cursor: wrote CLI approvals to {cli_path}")
+    except OSError as exc:
+        logger.warning("Could not write Cursor CLI MCP approvals: %s", exc)
+
+    return changed
 
 
 def _format_toml_value(value: Any) -> str:
@@ -390,6 +657,11 @@ def _format_toml_value(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, list):
         return "[" + ", ".join(_format_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        pairs = ", ".join(
+            f"{k} = {_format_toml_value(v)}" for k, v in value.items()
+        )
+        return "{ " + pairs + " }"
     raise TypeError(f"Unsupported TOML value: {type(value)!r}")
 
 
@@ -649,8 +921,26 @@ def install_platform_configs(
                         del existing[legacy_key]
                     migrated = True
             servers = existing.get(server_key, {})
+            if not isinstance(servers, dict):
+                servers = {}
             if "code-review-graph" in servers and not migrated:
-                print(f"  {plat['name']}: already configured in {config_path}")
+                updated, changed = _ensure_repo_in_server_entry(
+                    servers["code-review-graph"], repo_root,
+                )
+                if changed:
+                    servers["code-review-graph"] = updated
+                    existing[server_key] = servers
+                    config_path.parent.mkdir(parents=True, exist_ok=True)
+                    config_path.write_text(
+                        json.dumps(existing, indent=2) + "\n", encoding="utf-8",
+                    )
+                    print(f"  {plat['name']}: updated {config_path} (--repo)")
+                else:
+                    print(f"  {plat['name']}: already configured in {config_path}")
+                if key == "cursor":
+                    activate_cursor_mcp_server(
+                        repo_root, updated, dry_run=dry_run,
+                    )
                 _record_configured(key, plat)
                 continue
             servers["code-review-graph"] = server_entry
@@ -664,6 +954,11 @@ def install_platform_configs(
                 json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
             print(f"  {plat['name']}: configured {config_path}")
+
+        if key == "cursor":
+            activate_cursor_mcp_server(
+                repo_root, server_entry, dry_run=dry_run,
+            )
 
         _record_configured(key, plat)
 

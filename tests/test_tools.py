@@ -565,6 +565,7 @@ class TestGraphPathResolution:
             changed_files=["src/app.py"],
             repo_root=str(repo),
             include_source=False,
+            detail_level="standard",
         )
 
         changed = result["context"]["graph"]["changed_nodes"]

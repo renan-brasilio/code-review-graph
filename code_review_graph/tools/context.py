@@ -11,6 +11,7 @@ from typing import Any
 from ..incremental import get_db_path
 from ..parser import normalize_file_path
 from ._common import _get_store, _resolve_root, compact_response, graph_provenance
+from ._resolve import extract_symbol_names
 
 logger = logging.getLogger(__name__)
 
@@ -149,23 +150,50 @@ def get_minimal_context(
         except sqlite3.OperationalError:  # nosec B110 — table may not exist yet
             logger.debug("flows table not yet populated")
 
-        # 5. Suggest next tools based on task keywords
+        # 5. Suggest next tools based on task keywords / extracted symbols.
+        # trace_pipeline/trace_symbol_context are tuned for Apex/Java call
+        # graphs, so only prioritize them when the graph actually has that
+        # content — otherwise keep the language-agnostic suggestions.
         task_lower = task.lower()
+        symbols = extract_symbol_names(task)
+        has_apex_or_java = False
+        if symbols:
+            try:
+                has_apex_or_java = store._conn.execute(
+                    "SELECT 1 FROM nodes WHERE language IN ('apex', 'java') LIMIT 1"
+                ).fetchone() is not None
+            except sqlite3.OperationalError:
+                has_apex_or_java = False
+
         if any(w in task_lower for w in ("review", "pr", "merge", "diff")):
             suggestions = ["detect_changes", "get_affected_flows", "get_review_context"]
         elif any(w in task_lower for w in ("debug", "bug", "error", "fix")):
-            suggestions = ["semantic_search_nodes", "query_graph", "get_flow"]
+            suggestions = (
+                ["trace_symbol_context", "semantic_search_nodes", "query_graph"]
+                if has_apex_or_java
+                else ["semantic_search_nodes", "query_graph", "get_flow"]
+            )
         elif any(w in task_lower for w in ("refactor", "rename", "dead", "clean")):
             suggestions = ["refactor", "find_large_functions", "get_architecture_overview"]
-        elif any(w in task_lower for w in ("onboard", "understand", "explore", "arch")):
+        elif symbols and has_apex_or_java:
             suggestions = [
-                "get_architecture_overview", "list_communities", "list_flows",
+                "trace_pipeline once with include_source=true — then answer; no second trace call",
             ]
+        elif any(
+            w in task_lower
+            for w in ("onboard", "understand", "explore", "arch", "how", "work", "flow", "trigger")
+        ):
+            suggestions = (
+                ["trace_pipeline once with include_source=true"]
+                if has_apex_or_java
+                else ["get_architecture_overview", "list_communities", "list_flows"]
+            )
         else:
-            suggestions = [
-                "detect_changes", "semantic_search_nodes",
-                "get_architecture_overview",
-            ]
+            suggestions = (
+                ["trace_symbol_context", "semantic_search_nodes", "get_architecture_overview"]
+                if has_apex_or_java
+                else ["detect_changes", "semantic_search_nodes", "get_architecture_overview"]
+            )
 
         # Build summary
         summary_parts = [
@@ -179,7 +207,7 @@ def get_minimal_context(
 
         return compact_response(
             summary=" ".join(summary_parts),
-            key_entities=top_affected or None,
+            key_entities=symbols[:5] or top_affected or None,
             risk=risk,
             communities=communities or None,
             flows_affected=flows or None,

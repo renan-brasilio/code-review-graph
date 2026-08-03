@@ -222,3 +222,11 @@ open an issue — config-driven support is the on-ramp, not the ceiling.
 - The config is read when a parser is constructed (every `build`/`update`),
   so config changes take effect on the next build — re-run
   `uv run code-review-graph build` after editing.
+
+## Salesforce / Apex
+
+For Salesforce repos, add an `[languages.apex]` entry (see
+[docs/SALESFORCE.md](SALESFORCE.md)). Built-in resolvers then rewrite static
+`Class.method()` calls and wire trigger → handler chains. Metadata indexing
+for field formulas is optional via `.code-review-graph/metadata.toml`.
+

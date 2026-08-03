@@ -262,6 +262,29 @@ def _resolve_graph_file_paths(
     return resolved
 
 
+def snippet_coverage_fields(
+    source_snippets: dict[str, str] | None,
+    key_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Paths already returned in MCP snippets — agents must not Read them again."""
+    covered: list[str] = []
+    seen: set[str] = set()
+    for path in list(source_snippets or {}) + list(key_files or []):
+        if path and path not in seen:
+            seen.add(path)
+            covered.append(path)
+    if not covered:
+        return {}
+    return {
+        "covered_by_snippets": covered[:12],
+        "do_not_read_paths": covered[:12],
+        "token_hint": (
+            "Answer from source_snippets above. Do not Read, Grep, or re-call "
+            "trace_pipeline/trace_symbol_context for these paths."
+        ),
+    }
+
+
 def compact_response(
     summary: str,
     key_entities: list[str] | None = None,

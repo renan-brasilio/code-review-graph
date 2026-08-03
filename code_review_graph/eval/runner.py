@@ -123,6 +123,16 @@ def clone_or_update(config: dict, repos_dir: Path | None = None) -> Path:
     """
     repos_dir = repos_dir or DEFAULT_REPOS
     repos_dir.mkdir(parents=True, exist_ok=True)
+
+    if config.get("url") == "local":
+        local_path = config.get("local_path")
+        if local_path:
+            candidate = Path(local_path)
+            if not candidate.is_absolute():
+                candidate = Path(__file__).resolve().parents[2] / local_path
+            return candidate.resolve()
+        return (repos_dir / config["name"]).resolve()
+
     repo_path = repos_dir / config["name"]
 
     if repo_path.exists():

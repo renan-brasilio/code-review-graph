@@ -59,6 +59,8 @@ from .tools import (
     refactor_func,
     run_postprocess,
     semantic_search_nodes,
+    trace_pipeline,
+    trace_symbol_context,
     traverse_graph_func,
     with_provenance,
 )
@@ -91,7 +93,10 @@ mcp = FastMCP(
     instructions=(
         "Persistent incremental knowledge graph for token-efficient, "
         "context-aware code reviews. Parses your codebase with Tree-sitter, "
-        "builds a structural graph, and provides smart impact analysis."
+        "builds a structural graph, and provides smart impact analysis. "
+        "Prefer minimal detail_level, and prefer a single targeted tool call "
+        "with include_source=true over broad Grep/Read passes. "
+        "Do NOT Read paths listed in do_not_read_paths."
     ),
 )
 
@@ -254,7 +259,7 @@ def query_graph_tool(
     """Run a predefined graph query to explore code relationships.
 
     Available patterns:
-    - callers_of: Find functions that call the target
+    - callers_of: Find functions that call the target (prefer method names)
     - references_to: Find nodes that reference the target
     - callees_of: Find functions called by the target
     - imports_of: Find what the target imports
@@ -275,7 +280,7 @@ def query_graph_tool(
         pattern: Query pattern name (see above).
         target: Node name, qualified name, or file path to query.
         repo_root: Repository root path. Auto-detected if omitted.
-        detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        detail_level: "standard" (full output) or "minimal" (compact summary).
         max_results: Maximum results to return. Default: 100.
     """
     root = _resolve_repo_root(repo_root)
@@ -288,6 +293,7 @@ def query_graph_tool(
 @mcp.tool()
 def get_review_context_tool(
     changed_files: Optional[list[str]] = None,
+    target_symbols: Optional[list[str]] = None,
     max_depth: int = 2,
     include_source: bool = True,
     max_lines_per_file: int = 200,
@@ -295,24 +301,25 @@ def get_review_context_tool(
     base: str = "HEAD~1",
     detail_level: str = "standard",
 ) -> dict:
-    """Generate a focused, token-efficient review context for code changes.
+    """Generate focused review context for git changes or graph symbols.
 
-    Combines impact analysis with source snippets and review guidance.
-    Use this for comprehensive code reviews.
+    Combines impact analysis with source snippets. For architecture questions
+    without a diff, pass target_symbols instead of reading files manually.
 
     Args:
         changed_files: Files to review. Auto-detected from git diff if omitted.
+        target_symbols: Class/method names to fetch snippets for (no git diff).
         max_depth: Impact radius depth. Default: 2.
         include_source: Include source code snippets. Default: True.
         max_lines_per_file: Max source lines per file. Default: 200.
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for change detection. Default: HEAD~1.
-        detail_level: "standard" for full output, "minimal" for
-            token-efficient summary. Default: standard.
+        detail_level: "standard" (default) or "minimal".
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_review_context(
-        changed_files=changed_files, max_depth=max_depth,
+        changed_files=changed_files, target_symbols=target_symbols,
+        max_depth=max_depth,
         include_source=include_source, max_lines_per_file=max_lines_per_file,
         repo_root=root, base=base, detail_level=detail_level,
     ), root)
@@ -910,6 +917,7 @@ def traverse_graph_tool(
     depth: int = 3,
     token_budget: int = 2000,
     repo_root: Optional[str] = None,
+    detail_level: str = "minimal",
 ) -> dict:
     """BFS/DFS traversal from best-matching node with token budget.
 
@@ -931,6 +939,78 @@ def traverse_graph_tool(
         query=query, mode=mode, depth=depth,
         token_budget=token_budget,
         repo_root=root or "",
+        detail_level=detail_level,
+    ), root)
+
+
+@mcp.tool()
+def trace_pipeline_tool(
+    task: str = "",
+    anchor: str = "",
+    include_source: bool = False,
+    max_steps: int = 8,
+    max_source_files: int = 4,
+    max_lines_per_file: int = 40,
+    repo_root: Optional[str] = None,
+    detail_level: str = "minimal",
+) -> dict:
+    """End-to-end trigger/handler pipeline in one call (~2-3k tokens with snippets).
+
+    Use ONCE for "how does X work?" questions. If status=ok and source_snippets
+    are present, answer from them — do not Read those files or call trace again.
+
+    Args:
+        task: Natural language task (class names extracted automatically).
+        anchor: Optional anchor class/method (overrides task extraction).
+        include_source: Include trimmed source snippets for pipeline steps.
+        max_steps: Max pipeline steps returned. Default: 8.
+        max_source_files: Max snippet files when include_source=True. Default: 4.
+        max_lines_per_file: Max lines per snippet. Default: 40.
+        repo_root: Repository root path. Auto-detected if omitted.
+        detail_level: "minimal" (default) or "standard".
+    """
+    return trace_pipeline(
+        task=task,
+        anchor=anchor or "",
+        include_source=include_source,
+        max_steps=max_steps,
+        max_source_files=max_source_files,
+        max_lines_per_file=max_lines_per_file,
+        repo_root=_resolve_repo_root(repo_root),
+        detail_level=detail_level,
+    )
+
+
+@mcp.tool()
+def trace_symbol_context_tool(
+    target: str,
+    include_source: bool = False,
+    max_source_files: int = 4,
+    max_lines_per_file: int = 40,
+    repo_root: Optional[str] = None,
+    detail_level: str = "minimal",
+) -> dict:
+    """One-shot caller/callee map for a class or method (~200-1500 tokens).
+
+    Use only when trace_pipeline is insufficient (single-class follow-up).
+    Set include_source=True to get compact snippets instead of opening files.
+
+    Args:
+        target: Class or method name (e.g. StSampleRecordUtility).
+        include_source: Include trimmed source snippets for key nodes.
+        max_source_files: Max files when include_source=True. Default: 4.
+        max_lines_per_file: Max lines per snippet. Default: 40.
+        repo_root: Repository root path. Auto-detected if omitted.
+        detail_level: "minimal" (default) or "standard".
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(trace_symbol_context(
+        target=target,
+        include_source=include_source,
+        max_source_files=max_source_files,
+        max_lines_per_file=max_lines_per_file,
+        repo_root=root,
+        detail_level=detail_level,
     ), root)
 
 

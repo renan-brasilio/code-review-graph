@@ -1,0 +1,3 @@
+repo,task_id,nl_query,anchor_found,anchor_rank,neighbor_count,expected_count,matched_count,neighbor_recall,score
+salesforce-apex-fixture,sf-static-method-callers,updateSampleRecordLinks,True,0,2,1,1,1.0,1.0
+salesforce-apex-fixture,sf-trigger-to-handler,StSampleRecordTrigger,True,0,1,1,1,1.0,1.0

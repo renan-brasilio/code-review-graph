@@ -16,6 +16,15 @@ from ..incremental import get_changed_files, get_db_path, get_staged_and_unstage
 from ..parser import normalize_file_path
 from ..search import hybrid_search
 from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._resolve import (
+    _is_test_node,
+    collect_callees,
+    collect_callers,
+    collect_class_callees,
+    collect_class_callers,
+    compact_node,
+    resolve_query_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +235,41 @@ def get_impact_radius(
 # ---------------------------------------------------------------------------
 
 
+def _bound_prod_first(
+    results: list[dict[str, Any]],
+    edges_out: list[dict[str, Any]],
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Truncate aligned results/edges to *limit*, showing production entries first."""
+    paired = list(zip(results, edges_out))
+    prod_pairs = [p for p in paired if not _is_test_node(p[0])]
+    test_pairs = [p for p in paired if _is_test_node(p[0])]
+    kept = (prod_pairs + test_pairs)[:limit]
+    return [r for r, _ in kept], [e for _, e in kept]
+
+
+def _query_next_suggestions(
+    pattern: str,
+    node: Any | None,
+    match_tier: str | None,
+) -> list[str]:
+    if pattern == "callers_of" and node and node.kind == "Class":
+        return [
+            "trace_symbol_context for one-shot caller/callee map",
+            "query_graph callers_of on lifecycle method names",
+        ]
+    if match_tier == "parent_class_fallback":
+        return [
+            "Re-run callers_of after apex_static_resolver for method-precision",
+        ]
+    if pattern in ("callers_of", "callees_of"):
+        return [
+            "trace_symbol_context",
+            "get_review_context with target_symbols",
+        ]
+    return ["trace_symbol_context", "semantic_search_nodes"]
+
+
 def query_graph(
     pattern: str,
     target: str,
@@ -298,7 +342,7 @@ def query_graph(
                 "results": [], "edges": [],
             }
 
-        # Resolve target - try as-is, then as absolute path, then search.
+        # Resolve target - try as-is, then search with smart disambiguation.
         # file_summary targets are paths, so skip broad node search.
         node = None
         raw_config_target = pattern == "consumers_of" and "::" not in target
@@ -314,6 +358,13 @@ def query_graph(
                     if java_candidates is not None
                     else store.search_nodes(target, limit=20)
                 )
+                if java_candidates is None and "::" not in target:
+                    exact_name_candidates = [
+                        candidate for candidate in candidates
+                        if candidate.name == target
+                    ]
+                    if len(exact_name_candidates) == 1:
+                        candidates = exact_name_candidates
                 if pattern == "inheritors_of" and "::" not in target:
                     exact_type_candidates = [
                         candidate
@@ -356,54 +407,27 @@ def query_graph(
             return {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
+                "next_tool_suggestions": [
+                    "semantic_search_nodes",
+                    "trace_symbol_context",
+                ],
             }
 
+        target = node.qualified_name if node else target
         qn = node.qualified_name if node else target
 
+        match_tier: str | None = None
         if pattern == "callers_of":
-            seen_sources: set[str] = set()
-            for e in store.iter_edges_by_target(qn):
-                if e.kind == "CALLS":
-                    if e.source_qualified not in seen_sources:
-                        seen_sources.add(e.source_qualified)
-                        caller = store.get_node(e.source_qualified)
-                        if caller:
-                            add_result(node_to_dict(caller), e)
-            # Fallback: CALLS edges store unqualified target names
-            # (e.g. "generateTestCode") while qn is fully qualified
-            # (e.g. "file.ts::generateTestCode"). Search by plain name too.
-            if node:
-                cpp_overload_count = (
-                    store.count_nodes_by_name(
-                        node.name,
-                        language="cpp",
-                        kinds=("Function", "Test"),
-                    )
-                    if node.language == "cpp"
-                    else 0
-                )
-                for e in store.iter_edges_by_target_name(
-                    node.name,
-                    language=node.language or None,
-                ):
-                    # A C++ overload set deliberately keeps the target bare.
-                    # Its candidates support disambiguation, but do not prove
-                    # that any one exact overload was called.
-                    if (
-                        "ambiguous_targets" in e.extra
-                        or "unresolved_targets" in e.extra
-                        or (node.language == "cpp" and e.extra.get("receiver"))
-                    ):
-                        continue
-                    if cpp_overload_count > 1:
-                        continue
-                    if e.source_qualified not in seen_sources:
-                        seen_sources.add(e.source_qualified)
-                        caller = store.get_node(e.source_qualified)
-                        if caller:
-                            caller_result = node_to_dict(caller)
-                            caller_result["target_resolution"] = "unresolved"
-                            add_result(caller_result, e)
+            assert node is not None
+            if node.kind == "Class":
+                results, edges_out = collect_class_callers(store, node)
+                if results and any(r.get("via_method") for r in results):
+                    match_tier = "class_method_aggregation"
+            else:
+                results, edges_out, match_tier = collect_callers(store, node)
+
+            total_results = len(results)
+            results, edges_out = _bound_prod_first(results, edges_out, response_limit)
 
         elif pattern == "references_to":
             seen_reference_sources: set[str] = set()
@@ -419,54 +443,13 @@ def query_graph(
                     add_result(node_to_dict(source), e)
 
         elif pattern == "callees_of":
-            seen_targets: set[str] = set()
-            for e in store.iter_edges_by_source(qn):
-                if e.kind == "CALLS":
-                    if e.target_qualified not in seen_targets:
-                        seen_targets.add(e.target_qualified)
-                        callee = store.get_node(e.target_qualified)
-                        if callee:
-                            add_result(node_to_dict(callee), e)
-                        elif (
-                            isinstance(e.extra.get("ambiguous_targets"), list)
-                            or isinstance(e.extra.get("unresolved_targets"), list)
-                            or "::" not in e.target_qualified
-                            or (node is not None and node.language == "cpp")
-                        ):
-                            unresolved = (
-                                e.extra.get("ambiguous_targets")
-                                or e.extra.get("unresolved_targets")
-                            )
-                            result: dict[str, Any] = {
-                                "kind": "Function",
-                                "name": e.target_qualified,
-                                "qualified_name": e.target_qualified,
-                            }
-                            if isinstance(unresolved, list):
-                                resolution = (
-                                    "ambiguous"
-                                    if e.extra.get("ambiguous_targets")
-                                    else "unresolved"
-                                )
-                                result["resolution"] = resolution
-                                result["candidates"] = [
-                                    _sanitize_name(candidate)
-                                    for candidate in unresolved[:20]
-                                    if isinstance(candidate, str)
-                                ]
-                                candidate_count = e.extra.get(
-                                    f"{resolution}_target_count",
-                                )
-                                if not isinstance(candidate_count, int):
-                                    candidate_count = len(unresolved)
-                                result["candidate_count"] = candidate_count
-                                result["candidates_truncated"] = bool(
-                                    e.extra.get(
-                                        f"{resolution}_targets_truncated",
-                                    )
-                                    or candidate_count > len(result["candidates"])
-                                )
-                            add_result(result, e)
+            assert node is not None
+            if node.kind == "Class":
+                results, edges_out = collect_class_callees(store, node)
+            else:
+                results, edges_out = collect_callees(store, node)
+            total_results = len(results)
+            results, edges_out = _bound_prod_first(results, edges_out, response_limit)
 
         elif pattern == "imports_of":
             for e in store.iter_edges_by_source(qn):
@@ -656,15 +639,8 @@ def query_graph(
         if results_omitted:
             summary += f" — showing {len(results)}, {results_omitted} omitted"
 
+        suggestions = _query_next_suggestions(pattern, node, match_tier)
         if detail_level == "minimal":
-            minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path", "indirect")
-                    if k in r
-                }
-                for r in results
-            ]
             return {
                 "status": "ok",
                 "pattern": pattern,
@@ -673,10 +649,16 @@ def query_graph(
                 "summary": summary,
                 "result_count": total_results,
                 "results_omitted": results_omitted,
-                "results": minimal_results,
+                "match_tier": match_tier,
+                "results": [compact_node(r) for r in results[:12]],
+                "edges": [
+                    {k: e[k] for k in ("source", "target", "kind", "line") if k in e}
+                    for e in edges_out[:8]
+                ],
+                "next_tool_suggestions": suggestions,
             }
 
-        return {
+        response: dict[str, Any] = {
             "status": "ok",
             "pattern": pattern,
             "target": target,
@@ -686,7 +668,11 @@ def query_graph(
             "results_omitted": results_omitted,
             "results": results,
             "edges": edges_out,
+            "next_tool_suggestions": suggestions,
         }
+        if match_tier:
+            response["match_tier"] = match_tier
+        return response
     finally:
         store.close()
 
@@ -699,7 +685,7 @@ def query_graph(
 def semantic_search_nodes(
     query: str,
     kind: str | None = None,
-    limit: int = 20,
+    limit: int = 10,
     repo_root: str | None = None,
     context_files: list[str] | None = None,
     model: str | None = None,
@@ -739,22 +725,19 @@ def semantic_search_nodes(
         )
 
         if detail_level == "minimal":
-            minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path", "score")
-                    if k in r
-                }
-                for r in results[:5]
-            ]
+            minimal_results = [compact_node(r) for r in results[: min(limit, 5)]]
             return {
                 "status": "ok",
                 "query": query,
                 "search_mode": search_mode,
                 "summary": summary,
-                "results": minimal_results,
                 "result_count": len(results),
+                "results": minimal_results,
                 "results_omitted": max(0, len(results) - len(minimal_results)),
+                "next_tool_suggestions": [
+                    "trace_symbol_context",
+                    "query_graph callers_of",
+                ],
             }
 
         result: dict[str, object] = {
@@ -820,6 +803,14 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
         finally:
             emb_store.close()
 
+        # Add embedding hint for Salesforce / general discovery
+        embed_hint = None
+        if emb_count == 0:
+            embed_hint = (
+                "No embeddings indexed — run `code-review-graph embed --provider local` "
+                "for better semantic_search results"
+            )
+
         return {
             "status": "ok",
             "summary": "\n".join(summary_parts),
@@ -831,6 +822,7 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
             "files_count": stats.files_count,
             "last_updated": stats.last_updated,
             "embeddings_count": emb_count,
+            **({"embed_hint": embed_hint} if embed_hint else {}),
         }
     finally:
         store.close()
@@ -923,6 +915,7 @@ def traverse_graph_func(
     depth: int = 3,
     token_budget: int = 2000,
     repo_root: str | None = None,
+    detail_level: str = "minimal",
 ) -> dict[str, Any]:
     """BFS/DFS traversal from best-matching node.
 
@@ -935,14 +928,21 @@ def traverse_graph_func(
     """
     store, root = _get_store(repo_root)
     try:
-        results = hybrid_search(store, query, limit=1)
-        if not results:
-            return {
-                "error": f"No node matching '{query}'",
-                "nodes": [],
-            }
+        start_node = resolve_query_target(store, root, query, "callees_of")
+        if start_node:
+            start_qn = start_node.qualified_name
+        else:
+            search_results = hybrid_search(store, query, limit=3)
+            if not search_results:
+                return {
+                    "status": "not_found",
+                    "error": f"No node matching '{query}'",
+                    "nodes": [],
+                    "traversal": [],
+                    "next_tool_suggestions": ["semantic_search_nodes", "trace_symbol_context"],
+                }
+            start_qn = search_results[0]["qualified_name"]
 
-        start_qn = results[0]["qualified_name"]
         depth = max(1, min(depth, 6))
 
         # BFS / DFS traversal
@@ -983,12 +983,8 @@ def traverse_graph_func(
             traversal.append(entry)
 
             # Get neighbours
-            out_edges = store.get_edges_by_source(
-                current_qn
-            )
-            in_edges = store.get_edges_by_target(
-                current_qn
-            )
+            out_edges = store.get_edges_by_source(current_qn)
+            in_edges = store.get_edges_by_target(current_qn)
             for e in out_edges:
                 tgt = e.target_qualified
                 if tgt not in visited:
@@ -998,18 +994,31 @@ def traverse_graph_func(
                 if src not in visited:
                     queue.append((src, cur_depth + 1))
 
+        if detail_level == "minimal":
+            compact = [
+                {
+                    "name": t["name"],
+                    "kind": t["kind"],
+                    "depth": t["depth"],
+                    "file": Path(t["file"]).name if t.get("file") else "",
+                }
+                for t in traversal[:20]
+            ]
+        else:
+            compact = traversal
+
         return {
+            "status": "ok",
             "start_node": start_qn,
             "mode": mode,
             "max_depth": depth,
             "nodes_visited": len(traversal),
-            "traversal": traversal,
+            "traversal": compact,
+            "nodes": compact,
             "truncated": approx_tokens > token_budget,
             "next_tool_suggestions": [
-                "query_graph callers_of"
-                " -- focused relationship query",
-                "get_impact_radius"
-                " -- blast radius analysis",
+                "trace_symbol_context",
+                "query_graph callers_of",
             ],
         }
     finally:

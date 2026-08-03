@@ -103,6 +103,12 @@ _ENTRY_NAME_PATTERNS: list[re.Pattern[str]] = [
         r"^ng(OnInit|OnChanges|OnDestroy|DoCheck"
         r"|AfterContentInit|AfterContentChecked|AfterViewInit|AfterViewChecked)$"
     ),
+    # Salesforce Apex trigger handler lifecycle
+    re.compile(r"^after(Insert|Update|Delete)$"),
+    re.compile(r"^before(Insert|Update|Delete)$"),
+    re.compile(r"^andFinally$"),
+    re.compile(r"^bulk(Before|After)$"),
+    re.compile(r"^initialize$"),
     # Angular Pipe / ControlValueAccessor / Guards / Resolvers
     re.compile(r"^(transform|writeValue|registerOnChange|registerOnTouched|setDisabledState)$"),
     re.compile(r"^(canActivate|canDeactivate|canActivateChild|canLoad|canMatch|resolve)$"),

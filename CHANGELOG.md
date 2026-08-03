@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Salesforce / Apex enhancements**: static call resolution
+  (`apex_static_resolver`), trigger → handler `INVOKES` edges
+  (`apex_trigger_resolver`), parent-class `callers_of` fallback for method
+  queries, Salesforce lifecycle entry-point patterns in flow detection, optional
+  `*.field-meta.xml` metadata indexing, **`trace_pipeline_tool`** and
+  **`trace_symbol_context_tool`** for multi-hop architecture questions with
+  **`do_not_read_paths`** guidance, MCP **`serve --repo`** on install, and
+  eval config `salesforce-apex-fixture`. See docs/SALESFORCE.md.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

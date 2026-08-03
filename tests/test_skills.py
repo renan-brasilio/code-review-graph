@@ -21,11 +21,17 @@ from code_review_graph.skills import (
     PLATFORMS,
     _copilot_vscode_detected,
     _cursor_hook_scripts,
+    _cursor_mcp_cli_approval_key,
+    _cursor_mcp_config_hash,
+    _cursor_mcp_ide_approval_key,
     _detect_serve_command,
+    _ensure_repo_in_server_entry,
     _in_poetry_project,
     _in_uv_project,
+    _merge_cursor_ide_approval,
     _opencode_plugin_content,
     _strip_jsonc,
+    activate_cursor_mcp_server,
     generate_codex_hooks_config,
     generate_cursor_hooks_config,
     generate_hooks_config,
@@ -1010,6 +1016,69 @@ class TestInstallPlatformConfigs:
         data = json.loads(config_path.read_text())
         assert "code-review-graph" in data["mcpServers"]
         assert data["mcpServers"]["code-review-graph"]["type"] == "stdio"
+        args = data["mcpServers"]["code-review-graph"]["args"]
+        assert "--repo" in args
+        assert str(tmp_path.resolve()) in args
+        assert data["mcpServers"]["code-review-graph"].get("env", {}).get("CRG_REPO_ROOT")
+
+    def test_cursor_mcp_config_hash_matches_cursor(self):
+        """Hash must match Cursor MCPService.computeServerConfigHash."""
+        entry = {"command": "uvx", "args": ["code-review-graph", "serve"]}
+        assert _cursor_mcp_config_hash(entry) == "4a62455e"
+
+    def test_cursor_mcp_ide_approval_key(self, tmp_path):
+        entry = {"command": "uvx", "args": ["code-review-graph", "serve"]}
+        key = _cursor_mcp_ide_approval_key(tmp_path, entry)
+        assert key == f"project-0-{tmp_path.name}-code-review-graph:4a62455e"
+
+    def test_cursor_mcp_cli_approval_key(self, tmp_path):
+        entry = {
+            "command": "uvx",
+            "args": ["code-review-graph", "serve", "--repo", str(tmp_path.resolve())],
+            "env": {"CRG_REPO_ROOT": str(tmp_path.resolve())},
+        }
+        key = _cursor_mcp_cli_approval_key(tmp_path, entry)
+        assert key.startswith("code-review-graph-")
+        assert len(key.removeprefix("code-review-graph-")) == 16
+
+    def test_merge_cursor_ide_approval(self, tmp_path):
+        db_path = tmp_path / "state.vscdb"
+        conn = __import__("sqlite3").connect(db_path)
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+
+        assert _merge_cursor_ide_approval(db_path, "project-0-demo-code-review-graph:abc")
+        conn = __import__("sqlite3").connect(db_path)
+        row = conn.execute(
+            "SELECT value FROM ItemTable WHERE key = ?",
+            ("cursor/approvedProjectMcpServers",),
+        ).fetchone()
+        conn.close()
+        assert json.loads(row[0]) == ["project-0-demo-code-review-graph:abc"]
+        assert not _merge_cursor_ide_approval(db_path, "project-0-demo-code-review-graph:abc")
+
+    def test_activate_cursor_mcp_server_writes_cli_approvals(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.vscdb"
+        conn = __import__("sqlite3").connect(db_path)
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(
+            "code_review_graph.skills._cursor_global_state_db",
+            lambda: db_path,
+        )
+        monkeypatch.setattr(
+            "code_review_graph.skills._cursor_project_metadata_dir",
+            lambda root: tmp_path / "cursor-project",
+        )
+
+        entry = {"command": "uvx", "args": ["code-review-graph", "serve"]}
+        assert activate_cursor_mcp_server(tmp_path, entry) is True
+        approvals_path = tmp_path / "cursor-project" / "mcp-approvals.json"
+        assert approvals_path.exists()
+        cli_keys = json.loads(approvals_path.read_text())
+        assert cli_keys == [_cursor_mcp_cli_approval_key(tmp_path, entry)]
 
     def test_install_windsurf_config(self, tmp_path):
         windsurf_dir = tmp_path / ".codeium" / "windsurf"
@@ -1146,7 +1215,8 @@ class TestInstallPlatformConfigs:
         data = json.loads(gemini_config.read_text())
         entry = data["mcpServers"]["code-review-graph"]
         assert "type" not in entry
-        assert entry["args"][-1] == "serve"
+        assert "--repo" in entry["args"]
+        assert entry["args"][-1] == str(tmp_path.resolve())
 
     def test_install_qwen_config(self, tmp_path):
         """Qwen Code uses ~/.qwen/settings.json with mcpServers (see #83)."""
@@ -1166,7 +1236,8 @@ class TestInstallPlatformConfigs:
         data = json.loads(qwen_config.read_text())
         entry = data["mcpServers"]["code-review-graph"]
         assert entry["type"] == "stdio"
-        assert entry["args"][-1] == "serve"
+        assert "--repo" in entry["args"]
+        assert entry["args"][-1] == str(tmp_path.resolve())
 
     def test_install_qwen_preserves_existing_servers(self, tmp_path):
         """Adding qwen should merge with, not clobber, existing mcpServers."""
@@ -1944,6 +2015,11 @@ class TestCopilotCLIPlatform:
 class TestDetectServeCommand:
     """Tests for _detect_serve_command() and its helpers."""
 
+    @pytest.fixture(autouse=True)
+    def _no_dev_checkout(self, monkeypatch):
+        """Dev checkout auto-detection is tested separately."""
+        monkeypatch.setattr("code_review_graph.skills._dev_checkout_root", lambda: None)
+
     # ------------------------------------------------------------------
     # _in_poetry_project() unit tests
     # ------------------------------------------------------------------
@@ -2092,6 +2168,77 @@ class TestDetectServeCommand:
         monkeypatch.setattr("code_review_graph.skills.sys.executable", str(fake_python))
         monkeypatch.setattr("code_review_graph.skills.Path.home", staticmethod(lambda: tmp_path))
         assert _in_uv_project() is False
+
+
+class TestEnsureRepoInServerEntry:
+    """Tests for _ensure_repo_in_server_entry()."""
+
+    def test_preserves_uv_run_directory_args(self, tmp_path):
+        fork = tmp_path / "fork"
+        fork.mkdir()
+        app = tmp_path / "app"
+        app.mkdir()
+        entry = {
+            "command": "uv",
+            "args": [
+                "run",
+                "--directory",
+                str(fork),
+                "code-review-graph",
+                "serve",
+            ],
+            "type": "stdio",
+        }
+        merged, changed = _ensure_repo_in_server_entry(entry, app)
+        assert changed is True
+        assert merged["command"] == "uv"
+        assert merged["args"] == [
+            "run",
+            "--directory",
+            str(fork),
+            "code-review-graph",
+            "serve",
+            "--repo",
+            str(app.resolve()),
+        ]
+        assert merged["cwd"] == str(app.resolve())
+        assert merged["env"]["CRG_REPO_ROOT"] == str(app.resolve())
+
+    def test_updates_existing_repo_path(self, tmp_path):
+        app = tmp_path / "app"
+        app.mkdir()
+        other = tmp_path / "other"
+        other.mkdir()
+        entry = {
+            "command": "uvx",
+            "args": ["code-review-graph", "serve", "--repo", str(other)],
+        }
+        merged, changed = _ensure_repo_in_server_entry(entry, app)
+        assert changed is True
+        assert merged["args"][-1] == str(app.resolve())
+
+
+class TestDevCheckoutServeCommand:
+    """Tests for dev-checkout detection in _detect_serve_command()."""
+
+    def test_crg_dev_root_uses_uv_run_directory(self, monkeypatch, tmp_path):
+        dev_root = tmp_path / "code-review-graph"
+        dev_root.mkdir()
+        (dev_root / "pyproject.toml").write_text("[project]\nname='code-review-graph'\n")
+        monkeypatch.setenv("CRG_DEV_ROOT", str(dev_root))
+        monkeypatch.setattr(
+            "code_review_graph.skills.shutil.which",
+            lambda x: "/usr/bin/uv" if x == "uv" else None,
+        )
+        cmd, args = _detect_serve_command()
+        assert cmd == "uv"
+        assert args == [
+            "run",
+            "--directory",
+            str(dev_root.resolve()),
+            "code-review-graph",
+            "serve",
+        ]
 
 
 class TestOpenCodePluginContent:

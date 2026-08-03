@@ -1,0 +1,21 @@
+name: salesforce-apex-fixture
+url: local
+local_path: tests/fixtures/apex/acceptance_package_fixture
+commit: HEAD
+language: apex
+size_category: small
+
+multi_hop_tasks:
+  - id: sf-static-method-callers
+    nl_query: "updateSampleRecordLinks"
+    anchor_qualified_suffix: "stsamplerecordutility.updatesamplerecordlinks"
+    traversal_pattern: callers_of
+    expected_neighbor_names: ["andFinally"]
+    k: 10
+
+  - id: sf-trigger-to-handler
+    nl_query: "StSampleRecordTrigger"
+    anchor_qualified_suffix: "stsamplerecordtrigger"
+    traversal_pattern: callees_of
+    expected_neighbor_names: ["StSampleRecordTriggerHandler"]
+    k: 10

@@ -1788,6 +1788,24 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def get_nodes_by_parent(
+        self,
+        parent_name: str,
+        file_path: str | None = None,
+    ) -> list[GraphNode]:
+        """Return child nodes whose ``parent_name`` matches."""
+        if file_path:
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE parent_name = ? AND file_path = ?",
+                (parent_name, file_path),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE parent_name = ?",
+                (parent_name,),
+            ).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
     def count_flow_memberships(self, node_id: int) -> int:
         """Return the number of flows a node participates in."""
         row = self._conn.execute(

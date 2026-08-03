@@ -79,6 +79,7 @@ from .docs import embed_graph, generate_wiki_func, get_docs_section, get_wiki_pa
 
 # -- flows_tools ------------------------------------------------------------
 from .flows_tools import get_flow, list_flows
+from .pipeline_trace import trace_pipeline
 
 # -- query ------------------------------------------------------------------
 from .query import (
@@ -102,6 +103,7 @@ from .review import (
     get_affected_flows_func,
     get_review_context,
 )
+from .symbol_context import trace_symbol_context
 
 __all__ = [
     # _common
@@ -132,6 +134,8 @@ __all__ = [
     "list_graph_stats",
     "query_graph",
     "semantic_search_nodes",
+    "trace_pipeline",
+    "trace_symbol_context",
     "traverse_graph_func",
     # refactor_tools
     "apply_refactor_func",

@@ -13,7 +13,9 @@ from ..graph import edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_staged_and_unstaged
 from ..parser import normalize_file_path
-from ._common import _get_store, _resolve_graph_file_paths
+from ._common import _get_store, _resolve_graph_file_paths, snippet_coverage_fields
+from ._resolve import resolve_query_target
+from .symbol_context import _snippet_for_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 def get_review_context(
     changed_files: list[str] | None = None,
+    target_symbols: list[str] | None = None,
     max_depth: int = 2,
     include_source: bool = True,
     max_lines_per_file: int = 200,
@@ -32,12 +35,13 @@ def get_review_context(
     base: str = "HEAD~1",
     detail_level: str = "standard",
 ) -> dict[str, Any]:
-    """Generate a focused review context from changed files.
+    """Generate a focused review context from changed files or graph symbols.
 
     Builds a token-optimized subgraph + source snippets for code review.
 
     Args:
         changed_files: Files to review (auto-detected from git diff if omitted).
+        target_symbols: Optional class/method names to explore without git diff.
         max_depth: Impact radius depth (default: 2).
         include_source: Whether to include source code snippets (default: True).
         max_lines_per_file: Max source lines per file in output (default: 200).
@@ -46,7 +50,7 @@ def get_review_context(
         detail_level: Output detail level.  "standard" returns full context;
             "minimal" returns summary, risk level, changed/impacted file counts,
             top 5 key entity names, test gap count, and next tool suggestions.
-            Default: "standard".
+            Default: "minimal".
 
     Returns:
         Structured review context with subgraph, source snippets, and
@@ -54,6 +58,16 @@ def get_review_context(
     """
     store, root = _get_store(repo_root)
     try:
+        if target_symbols:
+            return _review_context_for_symbols(
+                store,
+                root,
+                target_symbols,
+                include_source=include_source,
+                max_lines_per_file=max_lines_per_file,
+                detail_level=detail_level,
+            )
+
         # Get impact radius first
         if changed_files is None:
             changed_files = get_changed_files(root, base)
@@ -187,6 +201,75 @@ def get_review_context(
         return result
     finally:
         store.close()
+
+
+def _review_context_for_symbols(
+    store,
+    root: Path,
+    target_symbols: list[str],
+    *,
+    include_source: bool,
+    max_lines_per_file: int,
+    detail_level: str,
+) -> dict[str, Any]:
+    """Build compact review context for explicit symbol names."""
+    nodes: list[dict] = []
+    rel_files: list[str] = []
+    seen_files: set[str] = set()
+
+    for symbol in target_symbols[:8]:
+        node = resolve_query_target(store, root, symbol, "callers_of")
+        if not node:
+            continue
+        entry = node_to_dict(node)
+        nodes.append(entry)
+        fp = entry.get("file_path")
+        if fp and fp not in seen_files:
+            seen_files.add(fp)
+            try:
+                rel_files.append(str(Path(fp).relative_to(root)))
+            except ValueError:
+                rel_files.append(fp)
+
+    if not nodes:
+        return {
+            "status": "not_found",
+            "summary": f"No graph nodes found for symbols: {', '.join(target_symbols)}",
+            "next_tool_suggestions": ["semantic_search_nodes", "trace_symbol_context"],
+        }
+
+    context: dict[str, Any] = {"target_symbols": target_symbols, "nodes": nodes}
+
+    if include_source:
+        context["source_snippets"] = _snippet_for_nodes(
+            root, nodes, max_files=len(target_symbols) + 2, max_lines_per_file=max_lines_per_file,
+        )
+
+    summary = (
+        f"Review context for {len(nodes)} symbol(s) across {len(rel_files)} file(s): "
+        + ", ".join(n["name"] for n in nodes[:5])
+    )
+
+    if detail_level == "minimal":
+        result: dict[str, Any] = {
+            "status": "ok",
+            "summary": summary,
+            "key_entities": [n["name"] for n in nodes[:8]],
+            "files": rel_files[:10],
+            "source_snippets": context.get("source_snippets"),
+            "next_tool_suggestions": ["Answer from source_snippets; do not Read files list"],
+        }
+        snippets = context.get("source_snippets")
+        if include_source and snippets:
+            result.update(snippet_coverage_fields(snippets, rel_files))
+        return result
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "context": context,
+        "next_tool_suggestions": ["trace_symbol_context", "query_graph callers_of"],
+    }
 
 
 def _extract_relevant_lines(

@@ -253,7 +253,11 @@ def _match_files_to_forget(
 
 def _handle_init(args: argparse.Namespace) -> None:
     """Set up MCP config for detected AI coding platforms."""
-    from .incremental import ensure_repo_gitignore_excludes_crg, find_repo_root
+    from .incremental import (
+        ensure_repo_gitignore_excludes_crg,
+        ensure_salesforce_languages_config,
+        find_repo_root,
+    )
     from .skills import install_platform_configs
 
     repo_root = Path(args.repo) if args.repo else find_repo_root()
@@ -295,6 +299,12 @@ def _handle_init(args: argparse.Namespace) -> None:
         print("Updated .gitignore with .code-review-graph/.")
     else:
         print(".gitignore already contains .code-review-graph/.")
+
+    sf_lang_state = ensure_salesforce_languages_config(repo_root)
+    if sf_lang_state == "created":
+        print("Installed .code-review-graph/languages.toml for Salesforce Apex indexing.")
+    elif sf_lang_state == "already-present":
+        print("Salesforce languages.toml already present.")
 
     # Platform-native skills and hooks are installed by default where supported
     # so the graph tools are used proactively. Use --no-skills / --no-hooks /

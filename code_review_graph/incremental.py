@@ -22,6 +22,9 @@ from typing import Callable, Optional
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
 
+_APEX_LANGUAGES_TEMPLATE = (
+    Path(__file__).resolve().parent / "data" / "languages_apex.toml"
+)
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
 
 # Set only while the in-process FastMCP server is using stdio transport.
@@ -151,6 +154,35 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
         logger.warning("Scoped call resolver failed: %s", exc)
         return None
 
+
+def _run_apex_static_resolver(store: GraphStore) -> Optional[dict]:
+    """Run the Apex static call resolver. Returns stats or None on error."""
+    try:
+        from .apex_static_resolver import resolve_apex_static_calls
+        return resolve_apex_static_calls(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Apex static resolver failed: %s", exc)
+        return None
+
+
+def _run_apex_trigger_resolver(store: GraphStore) -> Optional[dict]:
+    """Run the Apex trigger → handler resolver. Returns stats or None on error."""
+    try:
+        from .apex_trigger_resolver import resolve_apex_trigger_handlers
+        return resolve_apex_trigger_handlers(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Apex trigger resolver failed: %s", exc)
+        return None
+
+
+def _run_metadata_indexer(store: GraphStore, repo_root: Path) -> Optional[dict]:
+    """Index Salesforce metadata XML. Returns stats or None on error."""
+    try:
+        from .metadata_indexer import index_salesforce_metadata
+        return index_salesforce_metadata(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Salesforce metadata indexer failed: %s", exc)
+        return None
 
 # Default ignore patterns (in addition to .gitignore).
 #
@@ -428,6 +460,27 @@ def ensure_repo_gitignore_excludes_crg(repo_root: Path) -> str:
 
     if existing:
         return "updated"
+    return "created"
+
+
+def ensure_salesforce_languages_config(repo_root: Path) -> str:
+    """Install Apex ``languages.toml`` when ``sfdx-project.json`` is present.
+
+    Returns one of: ``created``, ``already-present``, ``skipped``.
+    """
+    if not (repo_root / "sfdx-project.json").is_file():
+        return "skipped"
+    dest = repo_root / ".code-review-graph" / "languages.toml"
+    if dest.exists():
+        return "already-present"
+    if not _APEX_LANGUAGES_TEMPLATE.is_file():
+        logger.warning("Bundled languages_apex.toml missing — cannot auto-install Apex config")
+        return "skipped"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        _APEX_LANGUAGES_TEMPLATE.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     return "created"
 
 
@@ -1063,6 +1116,7 @@ def full_build(
         recurse_submodules: If True, include files from git submodules.
             When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
     """
+    ensure_salesforce_languages_config(repo_root)
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
     stale_files = _reconcile_stale_files(repo_root, store, files)
@@ -1141,6 +1195,9 @@ def full_build(
     temporal_stats = _run_temporal_resolver(store)
     hcl_stats = _run_hcl_resolver(store)
     scoped_stats = _run_scoped_resolver(store)
+    apex_static_stats = _run_apex_static_resolver(store)
+    apex_trigger_stats = _run_apex_trigger_resolver(store)
+    metadata_stats = _run_metadata_indexer(store, repo_root)
 
     return {
         "files_parsed": len(files),
@@ -1155,6 +1212,9 @@ def full_build(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "apex_static_resolution": apex_static_stats,
+        "apex_trigger_resolution": apex_trigger_stats,
+        "metadata_indexing": metadata_stats,
     }
 
 
@@ -1336,6 +1396,18 @@ def incremental_update(
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
 
+    apex_changed = any(rp.endswith((".cls", ".trigger")) for rp in all_files)
+    apex_static_stats = _run_apex_static_resolver(store) if apex_changed else None
+    apex_trigger_stats = _run_apex_trigger_resolver(store) if apex_changed else None
+
+    metadata_changed = any(
+        "objects/" in rp.replace("\\", "/") and rp.endswith(".field-meta.xml")
+        for rp in all_files
+    ) or apex_changed
+    metadata_stats = (
+        _run_metadata_indexer(store, repo_root) if metadata_changed else None
+    )
+
     return {
         "files_updated": files_updated,
         "total_nodes": total_nodes,
@@ -1351,6 +1423,9 @@ def incremental_update(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "apex_static_resolution": apex_static_stats,
+        "apex_trigger_resolution": apex_trigger_stats,
+        "metadata_indexing": metadata_stats,
     }
 
 

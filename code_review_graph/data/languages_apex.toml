@@ -1,0 +1,8 @@
+# Salesforce Apex for code-review-graph (auto-installed when sfdx-project.json exists)
+[languages.apex]
+extensions = [".cls", ".trigger"]
+grammar = "apex"
+function_node_types = ["method_declaration", "constructor_declaration"]
+class_node_types = ["class_declaration", "trigger_declaration"]
+call_node_types = ["method_invocation"]
+comment = "Salesforce Apex — classes, triggers, method call graph"

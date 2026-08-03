@@ -4741,6 +4741,12 @@ class CodeParser:
                     )
                     resolved.append(edge)
                     continue
+                # Skip edges whose target will be rewritten by a post-build
+                # resolver (Java Spring DI, Apex static calls). C++ receivers
+                # have their own resolution/disambiguation just below.
+                if edge.extra.get("receiver") and not is_cpp:
+                    resolved.append(edge)
+                    continue
             cpp_lexical_receiver = is_cpp and receiver == "this"
             if (
                 is_cpp
@@ -10731,12 +10737,24 @@ class CodeParser:
                 receiver, method_name = self._get_member_call_receiver_method(
                     child, language,
                 )
-                if method_name:
-                    call_name = method_name
-                if receiver:
-                    call_extra["receiver"] = receiver
+            elif language == "apex" and child.type == "method_invocation":
+                method_name, receiver = self._get_java_method_and_receiver(child)
+            else:
+                receiver = method_name = None
+            if method_name:
+                call_name = method_name
+                if language == "apex":
+                    call_extra["method"] = method_name
+            if receiver:
+                call_extra["receiver"] = receiver
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
+                if (
+                    language == "apex"
+                    and receiver not in ("this", "super")
+                    and receiver[:1].isupper()
+                ):
+                    call_extra["apex_static"] = True
 
             if language == "java" and child.type == "method_invocation":
                 self._emit_spring_webflux_endpoint(
@@ -10783,7 +10801,7 @@ class CodeParser:
 
             # When a receiver is present, skip scope-based resolution: the method
             # lives on the receiver's type, not in the current file's scope.
-            # The spring_resolver post-pass will do the correct cross-type lookup.
+            # Language-specific resolvers do the correct cross-type lookup.
             receiver_name = call_extra.get("receiver")
             if receiver_name in ("self", "cls", "this") and enclosing_class:
                 target = (
