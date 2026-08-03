@@ -285,6 +285,41 @@ def snippet_coverage_fields(
     }
 
 
+def flag_flow_file_paths_covered(
+    result: dict[str, Any],
+    entries_key: str = "results",
+    file_key: str = "file_path",
+) -> dict[str, Any]:
+    """Mark SalesforceFlow node file paths as already covered by the response.
+
+    A SalesforceFlow node's ``extra["steps"]`` is already a compact summary
+    of the flow (see ``metadata_indexer.py``) — the raw ``*.flow-meta.xml``
+    can be large in real orgs, so re-reading it after the graph already
+    returned the node is wasted tokens. Unlike ``snippet_coverage_fields``,
+    this applies even when no source snippet was requested at all.
+
+    ``entries_key``/``file_key`` accommodate the different result shapes
+    across tools — ``query_graph``'s ``results`` use ``file_path``,
+    ``traverse_graph``'s ``traversal`` uses ``file``.
+    """
+    flow_paths = [
+        r[file_key]
+        for r in (result.get(entries_key) or [])
+        if isinstance(r, dict) and r.get("kind") == "SalesforceFlow" and r.get(file_key)
+    ]
+    if not flow_paths:
+        return result
+    coverage = snippet_coverage_fields(None, key_files=flow_paths)
+    if not coverage:
+        return result
+    merged = dict(result)
+    merged["do_not_read_paths"] = list(
+        dict.fromkeys(merged.get("do_not_read_paths", []) + coverage["do_not_read_paths"])
+    )
+    merged.setdefault("token_hint", coverage["token_hint"])
+    return merged
+
+
 def compact_response(
     summary: str,
     key_entities: list[str] | None = None,

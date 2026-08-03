@@ -1315,6 +1315,13 @@ def embed_all_nodes(graph_store: GraphStore, embedding_store: EmbeddingStore) ->
     for f in all_files:
         all_nodes.extend(graph_store.get_nodes_by_file(f))
 
+    # Salesforce metadata nodes (Field/SalesforceFlow/Object) have no File
+    # node counterpart — metadata_indexer.py upserts them directly rather
+    # than going through the source-file walk — so the loop above never
+    # finds them. Pull them in explicitly, or they're permanently invisible
+    # to semantic search regardless of how often `embed` runs.
+    all_nodes.extend(graph_store.get_nodes_by_language("salesforce_metadata"))
+
     return embedding_store.embed_nodes(all_nodes)
 
 

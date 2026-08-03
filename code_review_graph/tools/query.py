@@ -23,6 +23,7 @@ from ._resolve import (
     collect_class_callees,
     collect_class_callers,
     compact_node,
+    managed_package_not_found,
     resolve_query_target,
 )
 
@@ -404,6 +405,9 @@ def query_graph(
                     }
 
         if not node and pattern not in ("consumers_of", "file_summary"):
+            managed_hint = managed_package_not_found(store, target)
+            if managed_hint:
+                return managed_hint
             return {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
@@ -934,6 +938,9 @@ def traverse_graph_func(
         else:
             search_results = hybrid_search(store, query, limit=3)
             if not search_results:
+                managed_hint = managed_package_not_found(store, query)
+                if managed_hint:
+                    return {**managed_hint, "nodes": [], "traversal": []}
                 return {
                     "status": "not_found",
                     "error": f"No node matching '{query}'",

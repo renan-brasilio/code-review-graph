@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
-from typing import TYPE_CHECKING
+import sqlite3
+from typing import TYPE_CHECKING, Optional
 
 from ..graph import GraphNode, _sanitize_name, edge_to_dict, node_to_dict
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..graph import GraphStore
@@ -17,6 +22,80 @@ _SYMBOL_IN_TASK = re.compile(
     + "|".join(_HANDLER_SUFFIXES)
     + r"))\b"
 )
+
+# Sitetracker's own managed-package namespace aliases. Not customer data —
+# this is the company's own product namespace, same as already named in
+# docs/SALESFORCE.md.
+MANAGED_PACKAGE_NAMESPACES = ("sitetracker", "strk")
+
+
+def managed_package_namespace_hint(store: "GraphStore", target: str) -> Optional[str]:
+    """Return a namespace alias if *target* looks like a Sitetracker
+    managed-package symbol this repo cannot resolve locally by design.
+
+    A customer repo only contains its own org's code — the package's own
+    Apex/metadata source is never present, so a graph miss here is not a
+    dead end to retry with Grep/Read; it's a signal to switch tools
+    entirely. Two independent, unambiguous signals (no naming-convention
+    guessing, since customer code can legitimately share the "St" prefix
+    convention):
+
+    1. The target string itself carries a namespace marker — metadata form
+       (``sitetracker__Field__c``) or Apex code form (``sitetracker.Class``).
+    2. An Apex ``CALLS`` edge in this repo has ``extra.receiver`` set to the
+       namespace alias and matches the queried name — i.e. code in this
+       repo genuinely calls into the package under that name.
+    """
+    bare = target.split("::")[-1].split(".")[-1]
+    for ns in MANAGED_PACKAGE_NAMESPACES:
+        if bare.startswith(f"{ns}__") or f"{ns}." in target:
+            return ns
+
+    try:
+        rows = store._conn.execute(
+            "SELECT extra FROM edges WHERE kind = 'CALLS' AND ("
+            + " OR ".join("extra LIKE ?" for _ in MANAGED_PACKAGE_NAMESPACES)
+            + ")",
+            tuple(f'%"receiver": "{ns}"%' for ns in MANAGED_PACKAGE_NAMESPACES),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        logger.debug("managed_package_namespace_hint: edges table not queryable")
+        return None
+
+    for row in rows:
+        try:
+            extra = json.loads(row["extra"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        receiver = extra.get("receiver")
+        if receiver in MANAGED_PACKAGE_NAMESPACES and (
+            extra.get("method") == bare or receiver == bare
+        ):
+            return receiver
+    return None
+
+
+def managed_package_not_found(store: "GraphStore", target: str) -> Optional[dict]:
+    """A ``not_found``-shaped response redirecting to strk-mcp, or None."""
+    ns = managed_package_namespace_hint(store, target)
+    if not ns:
+        return None
+    return {
+        "status": "not_found",
+        "summary": (
+            f"'{target}' is not in this repo's graph — it looks like a "
+            f"Sitetracker managed-package symbol (namespace '{ns}'). This "
+            "repo only indexes the org's own code; the package's own "
+            "Apex/metadata source is never here, so further Grep/Read in "
+            "this repo will not find it."
+        ),
+        "managed_package_namespace": ns,
+        "next_tool_suggestions": [
+            "strk-mcp (strk_resolve_tag, then strk_repo_structure/strk_grep/"
+            "strk_read_file) for the package source — do not Grep/Read this "
+            "repo for it",
+        ],
+    }
 
 
 def extract_symbol_names(text: str) -> list[str]:

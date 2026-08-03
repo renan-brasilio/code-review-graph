@@ -456,6 +456,18 @@ class GraphStore:
             rows = self._conn.execute("SELECT * FROM nodes").fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def get_nodes_by_language(self, language: str) -> list[GraphNode]:
+        """Return all nodes for *language*.
+
+        Used for node groups with no ``File`` node counterpart (e.g.
+        ``salesforce_metadata`` — see ``metadata_indexer.py``), so callers
+        that discover nodes via ``get_all_files()`` can still find them.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE language = ?", (language,)
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
     def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
         return list(self.iter_edges_by_source(qualified_name))
 

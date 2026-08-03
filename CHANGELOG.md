@@ -15,8 +15,15 @@
   `sfdx-project.json` `packageDirectories` awareness for non-`force-app`
   package layouts, **`trace_pipeline_tool`** and
   **`trace_symbol_context_tool`** for multi-hop architecture questions with
-  **`do_not_read_paths`** guidance, MCP **`serve --repo`** on install, and
-  eval config `salesforce-apex-fixture`. See docs/SALESFORCE.md.
+  **`do_not_read_paths`** guidance (now also applied to `query_graph`/
+  `traverse_graph` results containing a `SalesforceFlow` node), a managed-
+  package redirect (`query_graph`/`traverse_graph`/`trace_symbol_context`
+  return `managed_package_namespace` + a strk-mcp suggestion instead of a
+  bare "not found" for `sitetracker__`/`strk__`-namespaced symbols), semantic
+  search coverage for `Field`/`SalesforceFlow`/`Object` nodes (previously
+  invisible to `embed`, since they have no `File` node counterpart), MCP
+  **`serve --repo`** on install, and eval config `salesforce-apex-fixture`.
+  See docs/SALESFORCE.md.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

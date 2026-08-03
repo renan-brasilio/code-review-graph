@@ -35,6 +35,9 @@ code-review-graph embed --provider local   # or openai
 ```
 
 When `embeddings_count` is 0, `list_graph_stats` suggests running embed.
+`Field`/`SalesforceFlow`/`Object` nodes are embedded too — natural-language
+questions like "which field stores the acceptance status" work without
+knowing the exact API name.
 
 ### 4. Optional: field formula metadata (Phase 6)
 
@@ -67,7 +70,13 @@ include_formulas = true
 
 - Prefer `callers_of` on the **method** node (not just the class).
 - If method query returns 0 on older builds, retry on the parent class.
-- Managed-package symbols (`sitetracker__`, `strk__`): still use strk-mcp in parallel.
+- Managed-package symbols (`sitetracker__`, `strk__`): `query_graph`,
+  `traverse_graph`, and `trace_symbol_context` now detect this automatically
+  — a miss on a namespaced symbol (or a symbol this repo's Apex calls via a
+  `sitetracker.`/`strk.` receiver) returns `managed_package_namespace` and a
+  `next_tool_suggestions` entry pointing at strk-mcp instead of a bare
+  "not found", so there's no need to retry with Grep/Read in this repo —
+  the package's own source is never here.
 
 ## What gets resolved
 

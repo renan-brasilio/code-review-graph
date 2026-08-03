@@ -36,6 +36,7 @@ from .tools import (
     detect_changes_func,
     embed_graph,
     find_large_functions,
+    flag_flow_file_paths_covered,
     generate_wiki_func,
     get_affected_flows_func,
     get_architecture_overview_func,
@@ -284,10 +285,11 @@ def query_graph_tool(
         max_results: Maximum results to return. Default: 100.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(query_graph(
+    result = query_graph(
         pattern=pattern, target=target, repo_root=root,
         detail_level=detail_level, max_results=max_results,
-    ), root)
+    )
+    return with_provenance(flag_flow_file_paths_covered(result), root)
 
 
 @mcp.tool()
@@ -935,12 +937,14 @@ def traverse_graph_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(traverse_graph_func(
+    result = traverse_graph_func(
         query=query, mode=mode, depth=depth,
         token_budget=token_budget,
         repo_root=root or "",
         detail_level=detail_level,
-    ), root)
+    )
+    result = flag_flow_file_paths_covered(result, entries_key="traversal", file_key="file")
+    return with_provenance(result, root)
 
 
 @mcp.tool()

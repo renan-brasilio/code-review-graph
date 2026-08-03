@@ -14,6 +14,7 @@ from ._resolve import (
     collect_class_callees,
     collect_class_callers,
     compact_node,
+    managed_package_not_found,
     partition_production_and_tests,
     resolve_query_target,
 )
@@ -103,6 +104,9 @@ def trace_symbol_context(
     try:
         node = resolve_query_target(store, root, target, "callers_of")
         if not node:
+            managed_hint = managed_package_not_found(store, target)
+            if managed_hint:
+                return managed_hint
             return {
                 "status": "not_found",
                 "summary": f"No graph node found for '{target}'.",

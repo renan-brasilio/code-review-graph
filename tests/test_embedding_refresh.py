@@ -109,6 +109,50 @@ class TestOrphanCleanup:
             graph.close()
 
 
+def _graph_with_salesforce_field(tmp_path):
+    db = tmp_path / "graph.db"
+    store = GraphStore(db)
+    field_path = str(tmp_path / "My_Field__c.field-meta.xml")
+    store.upsert_node(
+        NodeInfo(
+            kind="Field",
+            name="My_Field__c",
+            file_path=field_path,
+            line_start=1,
+            line_end=1,
+            language="salesforce_metadata",
+            parent_name="My_Object__c",
+            extra={"metadata_type": "CustomField"},
+        )
+    )
+    store.commit()
+    return store
+
+
+class TestSalesforceMetadataEmbedding:
+    def test_embed_all_nodes_finds_nodes_with_no_file_node_counterpart(self, tmp_path):
+        """metadata_indexer.py upserts Field/SalesforceFlow/Object nodes directly,
+        without a File node — the get_all_files()-driven walk in embed_all_nodes
+        can't discover them without an explicit language-based fetch."""
+        graph = _graph_with_salesforce_field(tmp_path)
+        assert graph.get_all_files() == []
+
+        provider = _StubProvider()
+        with patch("code_review_graph.embeddings.get_provider", return_value=provider):
+            embeddings = EmbeddingStore(graph.db_path, provider="local", model="test-model")
+        try:
+            embedded = embed_all_nodes(graph, embeddings)
+            assert embedded == 1
+            rows = embeddings._conn.execute(
+                "SELECT qualified_name FROM embeddings",
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["qualified_name"].endswith("::My_Object__c.My_Field__c")
+        finally:
+            embeddings.close()
+            graph.close()
+
+
 class TestExplicitRefresh:
     def test_never_embedded_graph_skips_without_resolving_provider(self, tmp_path):
         from code_review_graph.embeddings import refresh_embeddings
