@@ -186,12 +186,22 @@ def _run_metadata_indexer(store: GraphStore, repo_root: Path) -> Optional[dict]:
 
 
 def _run_lwc_apex_resolver(store: GraphStore) -> Optional[dict]:
-    """Resolve LWC/Aura @salesforce/apex and @salesforce/schema imports."""
+    """Resolve LWC/Aura @salesforce/apex, @salesforce/schema, @salesforce/label imports."""
     try:
         from .lwc_apex_resolver import resolve_lwc_apex_imports
         return resolve_lwc_apex_imports(store)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("LWC/Apex resolver failed: %s", exc)
+        return None
+
+
+def _run_apex_label_resolver(store: GraphStore) -> Optional[dict]:
+    """Resolve Apex Label.X references. Returns stats or None on error."""
+    try:
+        from .apex_label_resolver import resolve_apex_label_references
+        return resolve_apex_label_references(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Apex label resolver failed: %s", exc)
         return None
 
 # Default ignore patterns (in addition to .gitignore).
@@ -1209,6 +1219,7 @@ def full_build(
     apex_trigger_stats = _run_apex_trigger_resolver(store)
     metadata_stats = _run_metadata_indexer(store, repo_root)
     lwc_apex_stats = _run_lwc_apex_resolver(store)
+    apex_label_stats = _run_apex_label_resolver(store)
 
     return {
         "files_parsed": len(files),
@@ -1225,6 +1236,7 @@ def full_build(
         "scoped_resolution": scoped_stats,
         "apex_static_resolution": apex_static_stats,
         "lwc_apex_resolution": lwc_apex_stats,
+        "apex_label_resolution": apex_label_stats,
         "apex_trigger_resolution": apex_trigger_stats,
         "metadata_indexing": metadata_stats,
     }
@@ -1413,7 +1425,8 @@ def incremental_update(
     apex_trigger_stats = _run_apex_trigger_resolver(store) if apex_changed else None
 
     metadata_changed = any(
-        rp.endswith((".field-meta.xml", ".flow-meta.xml")) for rp in all_files
+        rp.endswith((".field-meta.xml", ".flow-meta.xml", "CustomLabels.labels-meta.xml"))
+        for rp in all_files
     ) or apex_changed
     metadata_stats = (
         _run_metadata_indexer(store, repo_root) if metadata_changed else None
@@ -1425,6 +1438,11 @@ def incremental_update(
         or any(rp.endswith((".js", ".ts")) for rp in all_files)
     )
     lwc_apex_stats = _run_lwc_apex_resolver(store) if lwc_changed else None
+
+    apex_label_changed = apex_changed or metadata_changed
+    apex_label_stats = (
+        _run_apex_label_resolver(store) if apex_label_changed else None
+    )
 
     return {
         "files_updated": files_updated,
@@ -1445,6 +1463,7 @@ def incremental_update(
         "apex_trigger_resolution": apex_trigger_stats,
         "metadata_indexing": metadata_stats,
         "lwc_apex_resolution": lwc_apex_stats,
+        "apex_label_resolution": apex_label_stats,
     }
 
 

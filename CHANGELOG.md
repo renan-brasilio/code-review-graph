@@ -32,6 +32,14 @@
   indexing on a Flow-XML-only change (it checked for `*.field-meta.xml`
   changes but not `*.flow-meta.xml`); a full `build` was the only way to
   pick up Flow edits.
+- **Custom Label indexing**: `labels/CustomLabels.labels-meta.xml` →
+  `Label` nodes, plus two resolvers — `apex_label_resolver` for `Label.X`
+  field access in Apex (a plain expression, not a call, so the generic
+  parser never captured it) scoped to the enclosing method, and
+  `lwc_apex_resolver`'s new `@salesforce/label/c.X` handling for LWC.
+  Previously `references_to` on a Custom Label found nothing at all,
+  despite every class following the org's own coding standard (user-
+  visible text must go through a Custom Label) depending on one.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
@@ -51,6 +59,14 @@
 
 ### Fixed
 
+- Fixed a `bandit` CI failure introduced by the Salesforce metadata work:
+  `xml.etree.ElementTree` usage in `metadata_indexer.py` (B405/B314 — flagged
+  as unsafe for untrusted XML, but these are local repo metadata files, same
+  trust level as any other source file the tool parses) and a false-positive
+  hardcoded-password match (B105) on an agent-guidance string in `_common.py`.
+  Both suppressed per-line with a justification comment, matching the
+  existing convention (see `prompts.py`'s identical B105 case) rather than a
+  blanket skip, so bandit still scans everything else in these files.
 - C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
   now resolve to canonical method nodes using receiver-type and namespace
   evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and

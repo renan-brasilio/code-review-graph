@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405 - parses local repo metadata files, not untrusted network XML
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -113,7 +113,7 @@ def _child_text(elem: ET.Element, tag: str) -> Optional[str]:
 
 def _parse_field_meta(path: Path) -> Optional[dict]:
     try:
-        tree = ET.parse(path)
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
     except ET.ParseError as exc:
         logger.warning("Malformed field metadata %s: %s", path, exc)
         return None
@@ -224,7 +224,7 @@ def _parse_flow_meta(path: Path) -> Optional[dict]:
     if not path.name.endswith(".flow-meta.xml"):
         return None
     try:
-        tree = ET.parse(path)
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
     except ET.ParseError as exc:
         logger.warning("Malformed flow metadata %s: %s", path, exc)
         return None
@@ -297,6 +297,61 @@ def _parse_flow_meta(path: Path) -> Optional[dict]:
         "subflow_refs": subflow_refs,
         "object_refs": sorted(object_refs),
     }
+
+
+def _parse_custom_labels(path: Path) -> list[dict]:
+    """Parse a ``CustomLabels.labels-meta.xml`` bundle into one dict per label.
+
+    Unlike fields/flows, all of an org's Custom Labels live in a single
+    file — Salesforce doesn't split these one-per-file.
+    """
+    try:
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
+    except ET.ParseError as exc:
+        logger.warning("Malformed custom labels metadata %s: %s", path, exc)
+        return []
+
+    labels: list[dict] = []
+    for elem in tree.getroot():
+        if _local(elem.tag) != "labels":
+            continue
+        full_name = _child_text(elem, "fullName")
+        if not full_name:
+            continue
+        labels.append({
+            "name": full_name,
+            "file_path": str(path),
+            "value": _child_text(elem, "value"),
+            "categories": _child_text(elem, "categories"),
+            "short_description": _child_text(elem, "shortDescription"),
+        })
+    return labels
+
+
+def _index_labels(store: GraphStore, label_files: list[Path]) -> dict:
+    labels_indexed = 0
+    for path in label_files:
+        for info in _parse_custom_labels(path):
+            extra: dict = {"metadata_type": "CustomLabel"}
+            if info.get("value"):
+                extra["value"] = info["value"]
+            if info.get("categories"):
+                extra["categories"] = info["categories"]
+            if info.get("short_description"):
+                extra["short_description"] = info["short_description"]
+            store.upsert_node(
+                NodeInfo(
+                    kind="Label",
+                    name=info["name"],
+                    file_path=info["file_path"],
+                    line_start=1,
+                    line_end=1,
+                    language="salesforce_metadata",
+                    extra=extra,
+                )
+            )
+            labels_indexed += 1
+    return {"labels_indexed": labels_indexed}
 
 
 def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
@@ -535,7 +590,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     empty = {
         "fields_indexed": 0, "references_created": 0, "references_unresolved": 0,
         "flows_indexed": 0, "flow_invokes_created": 0, "flow_invokes_unresolved": 0,
-        "flow_references_created": 0, "objects_indexed": 0,
+        "flow_references_created": 0, "objects_indexed": 0, "labels_indexed": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -547,18 +602,25 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
 
     field_files = _discover(paths, repo_root, "*.field-meta.xml")
     flow_files = _discover(paths, repo_root, "*.flow-meta.xml")
+    label_files = _discover(paths, repo_root, "CustomLabels.labels-meta.xml")
 
     field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
     flow_stats = _index_flows(store, flow_files, object_stub_seen)
+    label_stats = _index_labels(store, label_files)
 
-    if field_stats["fields_indexed"] or flow_stats["flows_indexed"]:
+    any_indexed = (
+        field_stats["fields_indexed"] or flow_stats["flows_indexed"]
+        or label_stats["labels_indexed"]
+    )
+    if any_indexed:
         store.commit()
 
     logger.info(
-        "Metadata indexer: %d field(s), %d flow(s), %d object stub(s), "
+        "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object stub(s), "
         "%d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
-        field_stats["fields_indexed"], flow_stats["flows_indexed"], len(object_stub_seen),
+        field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
+        len(object_stub_seen),
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],
@@ -566,5 +628,6 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     return {
         **field_stats,
         **flow_stats,
+        **label_stats,
         "objects_indexed": len(object_stub_seen),
     }

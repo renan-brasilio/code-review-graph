@@ -66,6 +66,7 @@ include_formulas = true
 | What Apex does a Salesforce Flow invoke? | `query_graph` | `callees_of` on the flow's qualified name, or filter `INVOKES` edges |
 | What object does a Flow act on? | `query_graph` | `REFERENCES` edges from the flow |
 | What LWC/Aura components call this Apex method? | `query_graph` | `callers_of` on the method — resolves `@salesforce/apex` imports automatically |
+| What uses this Custom Label? | `query_graph` | `references_to` on the label name — covers both `Label.X` in Apex and `@salesforce/label/c.X` in LWC |
 
 **Tips:**
 
@@ -87,7 +88,9 @@ include_formulas = true
 | `apex_trigger_resolver` | `createAndExecuteHandler(Handler.class)` in triggers | `INVOKES` edge to handler class |
 | `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal + `BELONGS_TO` edge to an `Object` node |
 | `metadata_indexer` | `*.flow-meta.xml` | `SalesforceFlow` node (process type, trigger, step summary in `extra`) + `INVOKES` edges to Apex classes (`actionCalls`) and subflows + `REFERENCES` edges to objects touched |
-| `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` imports in LWC/Aura `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
+| `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` / `@salesforce/label/c.LabelName` imports in LWC/Aura `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field / Label node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
+| `metadata_indexer` | `labels/CustomLabels.labels-meta.xml` | `Label` node per entry (value, categories, short description in `extra`) |
+| `apex_label_resolver` | `Label.X` field access in Apex `.cls`/`.trigger` | `REFERENCES` edge to the `Label` node, scoped to the enclosing method when one contains the reference |
 
 `Object` nodes are minimal stubs (name only) unless/until full
 `.object-meta.xml` parsing is added — this deliberately covers objects with

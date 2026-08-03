@@ -1,13 +1,14 @@
-"""Post-build resolver: LWC/Aura ``@salesforce/apex`` and ``@salesforce/schema``
-imports.
+"""Post-build resolver: LWC/Aura ``@salesforce/apex``, ``@salesforce/schema``,
+and ``@salesforce/label`` imports.
 
 Tree-sitter's generic JS/TS import handling stores these as bare, unresolved
 strings (``@salesforce/apex/ContactController.getContacts``) — there is no
 local file for a bare specifier to resolve against, so
-``callers_of``/``references_to`` on the Apex method or Field it names finds
-nothing, even though the LWC component genuinely calls or wires it.
+``callers_of``/``references_to`` on the Apex method, Field, or Label it
+names finds nothing, even though the LWC component genuinely calls, wires,
+or displays it.
 
-LWC import syntax for these two module families is a fixed, simple default
+LWC import syntax for these module families is a fixed, simple default
 import — ``import x from '@salesforce/apex/Class.method'`` — Salesforce's
 own framework requires this exact form (no destructuring, no renaming via
 braces), so a regex is reliable here without a second tree-sitter parse.
@@ -31,6 +32,12 @@ _APEX_IMPORT_RE = re.compile(
 )
 _SCHEMA_IMPORT_RE = re.compile(
     r"""import\s+(\w+)\s+from\s+['"]@salesforce/schema/([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)['"]"""
+)
+# @salesforce/label/c.LabelName — "c" here is Salesforce's fixed placeholder
+# for the org's own (unmanaged) namespace, always literally "c", not an
+# org-specific alias.
+_LABEL_IMPORT_RE = re.compile(
+    r"""import\s+(\w+)\s+from\s+['"]@salesforce/label/c\.([A-Za-z0-9_]+)['"]"""
 )
 
 
@@ -96,6 +103,7 @@ def resolve_lwc_apex_imports(store: GraphStore) -> dict:
         "apex_imports_resolved": 0, "apex_imports_unresolved": 0,
         "apex_calls_resolved": 0,
         "schema_imports_resolved": 0, "schema_imports_unresolved": 0,
+        "label_imports_resolved": 0, "label_imports_unresolved": 0,
     }
     conn = store._conn
 
@@ -105,7 +113,8 @@ def resolve_lwc_apex_imports(store: GraphStore) -> dict:
             "SELECT DISTINCT file_path FROM edges "
             "WHERE kind = 'IMPORTS_FROM' AND ("
             "target_qualified LIKE '@salesforce/apex/%' OR "
-            "target_qualified LIKE '@salesforce/schema/%'"
+            "target_qualified LIKE '@salesforce/schema/%' OR "
+            "target_qualified LIKE '@salesforce/label/%'"
             ")"
         ).fetchall()
     ]
@@ -127,11 +136,19 @@ def resolve_lwc_apex_imports(store: GraphStore) -> dict:
     ).fetchall():
         field_qual[(row["parent_name"], row["name"])] = row["qualified_name"]
 
+    label_qual: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT name, qualified_name FROM nodes WHERE kind = 'Label'"
+    ).fetchall():
+        label_qual.setdefault(row["name"], row["qualified_name"])
+
     apex_imports_resolved = 0
     apex_imports_unresolved = 0
     apex_calls_resolved = 0
     schema_imports_resolved = 0
     schema_imports_unresolved = 0
+    label_imports_resolved = 0
+    label_imports_unresolved = 0
 
     for file_path in js_files:
         path = Path(file_path)
@@ -163,19 +180,35 @@ def resolve_lwc_apex_imports(store: GraphStore) -> dict:
             else:
                 schema_imports_unresolved += 1
 
-    if apex_imports_resolved or schema_imports_resolved or apex_calls_resolved:
+        for _local_name, label_name in _LABEL_IMPORT_RE.findall(source):
+            resolved_qn = label_qual.get(label_name)
+            bare = f"@salesforce/label/c.{label_name}"
+            if _resolve_imports_from(conn, file_path, bare, resolved_qn):
+                label_imports_resolved += 1
+            else:
+                label_imports_unresolved += 1
+
+    any_resolved = (
+        apex_imports_resolved or schema_imports_resolved
+        or apex_calls_resolved or label_imports_resolved
+    )
+    if any_resolved:
         store.commit()
 
     logger.info(
         "LWC/Apex resolver: %d file(s), %d apex import(s) resolved (%d unresolved), "
-        "%d call/reference edge(s) resolved, %d schema import(s) resolved (%d unresolved)",
+        "%d call/reference edge(s) resolved, %d schema import(s) resolved (%d unresolved), "
+        "%d label import(s) resolved (%d unresolved)",
         len(js_files), apex_imports_resolved, apex_imports_unresolved,
         apex_calls_resolved, schema_imports_resolved, schema_imports_unresolved,
+        label_imports_resolved, label_imports_unresolved,
     )
     return {
         "files_indexed": len(js_files),
         "apex_imports_resolved": apex_imports_resolved,
         "apex_imports_unresolved": apex_imports_unresolved,
+        "label_imports_resolved": label_imports_resolved,
+        "label_imports_unresolved": label_imports_unresolved,
         "apex_calls_resolved": apex_calls_resolved,
         "schema_imports_resolved": schema_imports_resolved,
         "schema_imports_unresolved": schema_imports_unresolved,

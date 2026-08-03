@@ -278,7 +278,7 @@ def snippet_coverage_fields(
     return {
         "covered_by_snippets": covered[:12],
         "do_not_read_paths": covered[:12],
-        "token_hint": (
+        "token_hint": (  # nosec B105 — agent guidance string, not a password
             "Answer from source_snippets above. Do not Read, Grep, or re-call "
             "trace_pipeline/trace_symbol_context for these paths."
         ),
