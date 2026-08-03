@@ -514,6 +514,169 @@ def _index_labels(store: GraphStore, label_files: list[Path]) -> dict:
     return {"labels_indexed": labels_indexed, "labels_removed": labels_removed}
 
 
+def _bool_text(elem: ET.Element, tag: str) -> bool:
+    return (_child_text(elem, tag) or "false").strip().lower() == "true"
+
+
+def _parse_permission_set(path: Path) -> Optional[dict]:
+    """Parse a ``*.permissionset-meta.xml``.
+
+    Unlike fields/labels, PermissionSet metadata has no ``<fullName>``
+    element — the API name comes from the file name, same convention as
+    Flow.
+    """
+    if not path.name.endswith(".permissionset-meta.xml"):
+        return None
+    try:
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
+    except ET.ParseError as exc:
+        logger.warning("Malformed permission set metadata %s: %s", path, exc)
+        return None
+
+    root = tree.getroot()
+    name = path.name[: -len(".permissionset-meta.xml")]
+    label = None
+    description = None
+    class_names: list[str] = []
+    field_refs: list[tuple[str, str]] = []
+    object_refs: list[str] = []
+
+    for child in root:
+        tag = _local(child.tag)
+        if tag == "label" and child.text:
+            label = child.text.strip()
+        elif tag == "description" and child.text:
+            description = child.text.strip()
+        elif tag == "classAccesses":
+            apex_class = _child_text(child, "apexClass")
+            if apex_class and _bool_text(child, "enabled"):
+                class_names.append(apex_class)
+        elif tag == "fieldPermissions":
+            field_full = _child_text(child, "field")
+            if (
+                field_full and "." in field_full
+                and (_bool_text(child, "readable") or _bool_text(child, "editable"))
+            ):
+                obj, _, fld = field_full.partition(".")
+                field_refs.append((obj, fld))
+        elif tag == "objectPermissions":
+            obj = _child_text(child, "object")
+            has_any_permission = any(
+                _bool_text(child, perm)
+                for perm in (
+                    "allowCreate", "allowRead", "allowEdit", "allowDelete",
+                    "modifyAllRecords", "viewAllRecords",
+                )
+            )
+            if obj and has_any_permission:
+                object_refs.append(obj)
+
+    return {
+        "name": name,
+        "file_path": str(path),
+        "label": label,
+        "description": description,
+        "class_names": class_names,
+        "field_refs": field_refs,
+        "object_refs": object_refs,
+    }
+
+
+def _index_permission_sets(
+    store: GraphStore, ps_files: list[Path], object_stub_seen: set[str],
+) -> dict:
+    parsed = [info for info in (_parse_permission_set(p) for p in ps_files) if info]
+
+    class_qual: dict[str, str] = {}
+    for row in store._conn.execute(
+        "SELECT name, qualified_name FROM nodes WHERE kind = 'Class' AND language = 'apex'"
+    ).fetchall():
+        bare, qual = row["name"], row["qualified_name"]
+        if bare not in class_qual or len(qual) < len(class_qual[bare]):
+            class_qual[bare] = qual
+
+    field_qual: dict[tuple[str, str], str] = {}
+    for row in store._conn.execute(
+        "SELECT name, qualified_name, parent_name FROM nodes "
+        "WHERE kind = 'Field' AND language = 'salesforce_metadata'"
+    ).fetchall():
+        field_qual[(row["parent_name"], row["name"])] = row["qualified_name"]
+
+    permission_sets_indexed = 0
+    grants_created = 0
+    grants_unresolved = 0
+
+    for info in parsed:
+        ps_qn = f"{info['file_path']}::{info['name']}"
+        extra: dict = {"metadata_type": "PermissionSet"}
+        if info.get("label"):
+            extra["label"] = info["label"]
+        if info.get("description"):
+            extra["description"] = info["description"]
+        store.upsert_node(
+            NodeInfo(
+                kind="PermissionSet",
+                name=info["name"],
+                file_path=info["file_path"],
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra=extra,
+            )
+        )
+        permission_sets_indexed += 1
+
+        for cls in info["class_names"]:
+            target_qn = class_qual.get(cls)
+            edge_extra: dict = {"via": "classAccesses"}
+            if target_qn:
+                target = target_qn
+            else:
+                target = cls
+                edge_extra["unresolved_reference"] = True
+                grants_unresolved += 1
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="GRANTS", source=ps_qn, target=target,
+                    file_path=info["file_path"], line=1, extra=edge_extra,
+                )
+            )
+            grants_created += 1
+
+        for obj, fld in info["field_refs"]:
+            target_qn = field_qual.get((obj, fld))
+            edge_extra = {"via": "fieldPermissions"}
+            if target_qn:
+                target = target_qn
+            else:
+                target = f"{obj}.{fld}"
+                edge_extra["unresolved_reference"] = True
+                grants_unresolved += 1
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="GRANTS", source=ps_qn, target=target,
+                    file_path=info["file_path"], line=1, extra=edge_extra,
+                )
+            )
+            grants_created += 1
+
+        for obj in info["object_refs"]:
+            object_qn = _upsert_object_stub(store, obj, object_stub_seen)
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="GRANTS", source=ps_qn, target=object_qn,
+                    file_path=info["file_path"], line=1, extra={"via": "objectPermissions"},
+                )
+            )
+            grants_created += 1
+
+    return {
+        "permission_sets_indexed": permission_sets_indexed,
+        "grants_created": grants_created,
+        "grants_unresolved": grants_unresolved,
+    }
+
+
 def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
     seen: set[str] = set()
     found: list[Path] = []
@@ -536,15 +699,15 @@ def _remove_stale_metadata_files(store: GraphStore, current_paths: set[str]) -> 
     Metadata XML has no configured Tree-sitter language, so the general
     stale-file reconciliation in ``incremental.py`` (gated on
     ``parser.detect_language()``) never sees these files — a deleted
-    ``*.field-meta.xml``/``*.flow-meta.xml``/``CustomLabels.labels-meta.xml``
-    would otherwise leave a permanent phantom node behind on every
-    subsequent full ``build``.
+    ``*.field-meta.xml``/``*.flow-meta.xml``/``CustomLabels.labels-meta.xml``/
+    ``*.permissionset-meta.xml`` would otherwise leave a permanent phantom
+    node behind on every subsequent full ``build``.
     """
     stored_paths = {
         row["file_path"]
         for row in store._conn.execute(
             "SELECT DISTINCT file_path FROM nodes "
-            "WHERE kind IN ('Field', 'SalesforceFlow', 'Label')"
+            "WHERE kind IN ('Field', 'SalesforceFlow', 'Label', 'PermissionSet')"
         ).fetchall()
     }
     stale = stored_paths - current_paths
@@ -777,6 +940,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         "flow_references_created": 0, "objects_indexed": 0, "labels_indexed": 0,
         "labels_removed": 0, "stale_metadata_files_removed": 0,
         "real_objects_indexed": 0, "objects_downgraded": 0,
+        "permission_sets_indexed": 0, "grants_created": 0, "grants_unresolved": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -789,14 +953,18 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     flow_files = _discover(paths, repo_root, "*.flow-meta.xml")
     label_files = _discover(paths, repo_root, "CustomLabels.labels-meta.xml")
     object_files = _discover(paths, repo_root, "*.object-meta.xml")
+    permission_set_files = _discover(paths, repo_root, "*.permissionset-meta.xml")
 
-    current_paths = {str(p) for p in (*field_files, *flow_files, *label_files)}
+    current_paths = {
+        str(p) for p in (*field_files, *flow_files, *label_files, *permission_set_files)
+    }
     stale_removed = _remove_stale_metadata_files(store, current_paths)
 
     # Objects first: real .object-meta.xml (including CMT type definitions,
-    # same format) must land before Field/Flow indexing so their stub
-    # fallback doesn't clobber real data — object_stub_seen pre-seeded with
-    # real names is what makes _upsert_object_stub a no-op for them.
+    # same format) must land before Field/Flow/PermissionSet indexing so
+    # their stub fallback doesn't clobber real data — object_stub_seen
+    # pre-seeded with real names is what makes _upsert_object_stub a no-op
+    # for them.
     real_object_stats, real_object_names = _index_objects(store, object_files)
     objects_downgraded = _downgrade_stale_real_objects(store, real_object_names)
     object_stub_seen: set[str] = set(real_object_names)
@@ -804,23 +972,28 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
     flow_stats = _index_flows(store, flow_files, object_stub_seen)
     label_stats = _index_labels(store, label_files)
+    # After fields: permission set fieldPermissions resolve against Field
+    # nodes, which only exist once _index_fields has run.
+    ps_stats = _index_permission_sets(store, permission_set_files, object_stub_seen)
 
     any_indexed = (
         field_stats["fields_indexed"] or flow_stats["flows_indexed"]
         or label_stats["labels_indexed"] or real_object_stats["objects_indexed"]
-        or objects_downgraded
+        or objects_downgraded or ps_stats["permission_sets_indexed"]
     )
     if any_indexed:
         store.commit()
 
     logger.info(
         "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object(s) "
-        "(%d real, %d downgraded), %d stale file(s) removed, %d stale label(s) removed, "
+        "(%d real, %d downgraded), %d permission set(s) (%d grant(s), %d unresolved), "
+        "%d stale file(s) removed, %d stale label(s) removed, "
         "%d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
         field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
         len(object_stub_seen), real_object_stats["objects_indexed"], objects_downgraded,
-        stale_removed, label_stats["labels_removed"],
+        ps_stats["permission_sets_indexed"], ps_stats["grants_created"],
+        ps_stats["grants_unresolved"], stale_removed, label_stats["labels_removed"],
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],
@@ -829,6 +1002,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         **field_stats,
         **flow_stats,
         **label_stats,
+        **ps_stats,
         "objects_indexed": len(object_stub_seen),
         "real_objects_indexed": real_object_stats["objects_indexed"],
         "objects_downgraded": objects_downgraded,

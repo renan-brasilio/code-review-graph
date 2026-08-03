@@ -457,3 +457,163 @@ class TestObjectIndexing:
         assert row is not None  # never deleted, only downgraded
         assert '"synthesized": true' in row["extra"]
         store.close()
+
+
+PERMISSION_SET_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Sample Permission Set</label>
+    <description>Grants access for sample record processing.</description>
+    <classAccesses>
+        <apexClass>StSampleRecordUtility</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <classAccesses>
+        <apexClass>DisabledClass</apexClass>
+        <enabled>false</enabled>
+    </classAccesses>
+    <classAccesses>
+        <apexClass>NonexistentClass</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <fieldPermissions>
+        <field>Sample_Record_Link__c.Record_Identifier_Key__c</field>
+        <readable>true</readable>
+        <editable>false</editable>
+    </fieldPermissions>
+    <fieldPermissions>
+        <field>Sample_Record_Link__c.Nonexistent_Field__c</field>
+        <readable>true</readable>
+        <editable>false</editable>
+    </fieldPermissions>
+    <objectPermissions>
+        <object>Sample_Record_Link__c</object>
+        <allowRead>true</allowRead>
+        <allowCreate>false</allowCreate>
+        <allowEdit>false</allowEdit>
+        <allowDelete>false</allowDelete>
+        <modifyAllRecords>false</modifyAllRecords>
+        <viewAllRecords>false</viewAllRecords>
+    </objectPermissions>
+    <objectPermissions>
+        <object>No_Access_Object__c</object>
+        <allowRead>false</allowRead>
+        <allowCreate>false</allowCreate>
+        <allowEdit>false</allowEdit>
+        <allowDelete>false</allowDelete>
+        <modifyAllRecords>false</modifyAllRecords>
+        <viewAllRecords>false</viewAllRecords>
+    </objectPermissions>
+</PermissionSet>
+"""
+
+
+class TestPermissionSetIndexing:
+    def _build_fixture(self, tmp_path: Path):
+        (tmp_path / ".git").mkdir()
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        objects_dir.mkdir(parents=True)
+        _copy_object("Sample_Record_Link__c", objects_dir)
+
+        ps_dir = tmp_path / "force-app" / "main" / "default" / "permissionsets"
+        ps_dir.mkdir(parents=True)
+        ps_file = ps_dir / "Sample_Permission_Set.permissionset-meta.xml"
+        ps_file.write_text(PERMISSION_SET_XML, encoding="utf-8")
+
+        store = GraphStore(get_db_path(tmp_path))
+        store.upsert_node(
+            NodeInfo(
+                kind="Class", name="StSampleRecordUtility",
+                file_path=str(tmp_path / "StSampleRecordUtility.cls"),
+                line_start=1, line_end=3, language="apex",
+            )
+        )
+        store.commit()
+        return store, ps_file
+
+    def test_indexes_permission_set_with_label_and_description(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["permission_sets_indexed"] == 1
+
+        row = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='PermissionSet' "
+            "AND name='Sample_Permission_Set'"
+        ).fetchone()
+        assert row is not None
+        assert "Sample Permission Set" in row["extra"]
+        assert "sample record processing" in row["extra"]
+        store.close()
+
+    def test_enabled_class_access_resolves_disabled_and_missing_do_not(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        stats = index_salesforce_metadata(store, tmp_path)
+        # classAccesses: 1 enabled+resolved, 1 disabled (skipped), 1 enabled+unresolved.
+        # fieldPermissions also has one unresolved field, for 2 total.
+        assert stats["grants_unresolved"] == 2
+
+        ps_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='PermissionSet'"
+        ).fetchone()["qualified_name"]
+        class_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Class' "
+            "AND name='StSampleRecordUtility'"
+        ).fetchone()["qualified_name"]
+
+        edges = store._conn.execute(
+            "SELECT target_qualified, extra FROM edges WHERE kind='GRANTS' "
+            "AND source_qualified = ? AND extra LIKE '%classAccesses%'",
+            (ps_qn,),
+        ).fetchall()
+        # Only the enabled, resolvable, and enabled-but-unresolved entries create edges —
+        # the disabled DisabledClass access is skipped entirely (2 edges, not 3).
+        assert len(edges) == 2
+        targets = {row["target_qualified"] for row in edges}
+        assert class_qn in targets
+        assert "NonexistentClass" in targets
+        store.close()
+
+    def test_field_and_object_permissions_resolve_to_real_nodes(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        index_salesforce_metadata(store, tmp_path)
+
+        field_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Field' "
+            "AND name='Record_Identifier_Key__c'"
+        ).fetchone()["qualified_name"]
+        object_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Object' "
+            "AND name='Sample_Record_Link__c'"
+        ).fetchone()["qualified_name"]
+
+        field_edge = store._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind='GRANTS' AND target_qualified=?",
+            (field_qn,),
+        ).fetchone()
+        object_edge = store._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind='GRANTS' AND target_qualified=?",
+            (object_qn,),
+        ).fetchone()
+        assert field_edge is not None
+        assert object_edge is not None
+
+        # No object-level permission granted for No_Access_Object__c -> no edge at all.
+        no_access_edges = store._conn.execute(
+            "SELECT 1 FROM edges WHERE kind='GRANTS' AND target_qualified LIKE '%No_Access_Object__c%'"
+        ).fetchall()
+        assert no_access_edges == []
+        store.close()
+
+    def test_deleted_permission_set_file_is_removed_on_next_index_run(self, tmp_path):
+        store, ps_file = self._build_fixture(tmp_path)
+        index_salesforce_metadata(store, tmp_path)
+        assert store._conn.execute(
+            "SELECT 1 FROM nodes WHERE kind='PermissionSet'"
+        ).fetchone()
+
+        ps_file.unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["stale_metadata_files_removed"] == 1
+        assert store._conn.execute(
+            "SELECT 1 FROM nodes WHERE kind='PermissionSet'"
+        ).fetchone() is None
+        store.close()

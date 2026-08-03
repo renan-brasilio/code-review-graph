@@ -50,6 +50,14 @@
   reference). Custom Metadata Type *definitions*
   (`objects/X__mdt/X__mdt.object-meta.xml`) use the identical format, so
   they're covered by the same code path, flagged `is_custom_metadata_type`.
+- **Permission Set indexing**: `permissionsets/X.permissionset-meta.xml` →
+  `PermissionSet` node + `GRANTS` edges to Apex classes (enabled
+  `classAccesses` only — disabled entries are skipped, not resolved-and-
+  ignored), Fields (`fieldPermissions` with read or edit access), and
+  Objects (`objectPermissions` with any permission granted). Unresolved
+  targets are flagged, not silently dropped. Profiles use the identical
+  `classAccesses`/`fieldPermissions`/`objectPermissions` shape but aren't
+  indexed yet.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
