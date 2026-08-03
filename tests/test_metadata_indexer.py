@@ -7,6 +7,7 @@ from pathlib import Path
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import get_db_path
 from code_review_graph.metadata_indexer import index_salesforce_metadata
+from code_review_graph.parser import NodeInfo
 from code_review_graph.search import hybrid_search
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "salesforce"
@@ -117,4 +118,106 @@ class TestMetadataIndexer:
         store = GraphStore(get_db_path(tmp_path))
         stats = index_salesforce_metadata(store, tmp_path)
         assert stats["fields_indexed"] == 1
+        store.close()
+
+    def test_field_belongs_to_object_stub(self, tmp_path):
+        objects_dir = (
+            tmp_path / "force-app" / "main" / "default" / "objects"
+            / "Sample_Record_Link__c" / "fields"
+        )
+        objects_dir.mkdir(parents=True)
+        shutil.copy(
+            FIXTURE / "objects" / "Sample_Record_Link__c" / "fields"
+            / "Record_Identifier_Key__c.field-meta.xml",
+            objects_dir / "Record_Identifier_Key__c.field-meta.xml",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["objects_indexed"] == 1
+
+        obj = store._conn.execute(
+            "SELECT qualified_name, extra FROM nodes WHERE kind='Object' AND name='Sample_Record_Link__c'"
+        ).fetchone()
+        assert obj is not None
+        assert "synthesized" in obj["extra"]
+
+        edge = store._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind='BELONGS_TO'"
+        ).fetchone()
+        assert edge is not None
+        assert edge["target_qualified"] == obj["qualified_name"]
+        store.close()
+
+
+class TestFlowIndexer:
+    def _write_flows(self, tmp_path: Path) -> Path:
+        flows_dir = tmp_path / "force-app" / "main" / "default" / "flows"
+        flows_dir.mkdir(parents=True)
+        for name in ("Sample_Record_After_Save", "Sample_Record_Link_Generator"):
+            shutil.copy(
+                FIXTURE / "flows" / f"{name}.flow-meta.xml",
+                flows_dir / f"{name}.flow-meta.xml",
+            )
+        return flows_dir
+
+    def test_indexes_flow_with_apex_subflow_and_object_refs(self, tmp_path):
+        self._write_flows(tmp_path)
+
+        store = GraphStore(get_db_path(tmp_path))
+        # Seed an Apex Class node so the actionCalls -> Apex edge can resolve.
+        store.upsert_node(
+            NodeInfo(
+                kind="Class",
+                name="StSampleRecordUtility",
+                file_path=str(tmp_path / "StSampleRecordUtility.cls"),
+                line_start=1,
+                line_end=3,
+                language="apex",
+            )
+        )
+        store.commit()
+
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["flows_indexed"] == 2
+        assert stats["flow_invokes_created"] == 2
+        assert stats["flow_invokes_unresolved"] == 0
+        assert stats["flow_references_created"] == 2
+        assert stats["objects_indexed"] == 2
+
+        flow_a = store._conn.execute(
+            "SELECT qualified_name, extra FROM nodes WHERE kind='SalesforceFlow' "
+            "AND name='Sample_Record_After_Save'"
+        ).fetchone()
+        assert flow_a is not None
+        assert "\"process_type\": \"AutoLaunchedFlow\"" in flow_a["extra"]
+        assert "\"trigger_object\": \"Sample_Record__c\"" in flow_a["extra"]
+
+        invoke_edges = store._conn.execute(
+            "SELECT target_qualified, extra FROM edges WHERE kind='INVOKES' "
+            "AND source_qualified = ?",
+            (flow_a["qualified_name"],),
+        ).fetchall()
+        assert len(invoke_edges) == 2
+        for row in invoke_edges:
+            assert "unresolved_reference" not in (row["extra"] or "")
+
+        apex_class = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Class' AND name='StSampleRecordUtility'"
+        ).fetchone()
+        subflow_b = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='SalesforceFlow' "
+            "AND name='Sample_Record_Link_Generator'"
+        ).fetchone()
+        targets = {row["target_qualified"] for row in invoke_edges}
+        assert apex_class["qualified_name"] in targets
+        assert subflow_b["qualified_name"] in targets
+        store.close()
+
+    def test_unresolved_apex_action_and_subflow_are_flagged(self, tmp_path):
+        self._write_flows(tmp_path)
+        store = GraphStore(get_db_path(tmp_path))
+        # No Apex Class node seeded this time — StSampleRecordUtility can't resolve.
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["flow_invokes_unresolved"] == 1
         store.close()

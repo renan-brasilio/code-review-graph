@@ -60,6 +60,8 @@ include_formulas = true
 | Trigger → handler chain | `query_graph` | `callees_of` on trigger qualified name |
 | End-to-end flow | `traverse_graph` | Start at utility or trigger, depth 4 |
 | Field formula lookup | `semantic_search_nodes` | Query field API name |
+| What Apex does a Salesforce Flow invoke? | `query_graph` | `callees_of` on the flow's qualified name, or filter `INVOKES` edges |
+| What object does a Flow act on? | `query_graph` | `REFERENCES` edges from the flow |
 
 **Tips:**
 
@@ -73,7 +75,19 @@ include_formulas = true
 |----------|-------|--------|
 | `apex_static_resolver` | `Class.method()` CALLS with bare class target | Qualified method target |
 | `apex_trigger_resolver` | `createAndExecuteHandler(Handler.class)` in triggers | `INVOKES` edge to handler class |
-| `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal |
+| `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal + `BELONGS_TO` edge to an `Object` node |
+| `metadata_indexer` | `*.flow-meta.xml` | `SalesforceFlow` node (process type, trigger, step summary in `extra`) + `INVOKES` edges to Apex classes (`actionCalls`) and subflows + `REFERENCES` edges to objects touched |
+
+`Object` nodes are minimal stubs (name only) unless/until full
+`.object-meta.xml` parsing is added — this deliberately covers objects with
+no local object metadata at all, which is the normal case when extending a
+managed package's object (adding a field or a flow that queries it) without
+redeclaring metadata that would drift from the installed package version.
+
+Note: the node kind is `SalesforceFlow`, not `Flow` — `flows.py` /
+`get_flow_tool` already use "flow" for a derived concept (execution paths
+through the call graph), unrelated to Salesforce's declarative Flow
+automation metadata.
 
 ## Probe Apex AST locally
 
@@ -94,9 +108,14 @@ code-review-graph eval --repo salesforce-apex-fixture --benchmark multi_hop_retr
 
 Uses the sample trigger/handler fixture under `tests/fixtures/apex/acceptance_package_fixture/`.
 
-## Limitations (v1)
+## Limitations
 
-- No Flow XML, CMT, permission sets, or layouts
+- Flow XML indexing is one node per flow — the internal step sequence is
+  a compact summary in `extra["steps"]`, not a fully exploded per-element
+  graph. Decision branch logic (which rule leads where) isn't distinguished.
+- No permission sets, profiles, layouts, or custom metadata type records
+- `Object` nodes are stubs (name only) until full `.object-meta.xml`
+  parsing is added
 - No cross-org / deployed metadata
 - No runtime Apex semantics (governor limits, sharing, etc.)
 

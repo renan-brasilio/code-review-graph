@@ -1,8 +1,15 @@
-"""Salesforce metadata indexer — field formulas and object references.
+"""Salesforce metadata indexer — fields, flows, and object references.
 
-Parses ``*.field-meta.xml`` under configured paths and creates ``Field`` nodes
-with formula text in ``extra``, plus ``REFERENCES`` edges to related objects
-and fields mentioned in formulas.
+Parses ``*.field-meta.xml`` and ``*.flow-meta.xml`` under configured paths.
+Creates ``Field`` nodes with formula text in ``extra``, ``SalesforceFlow``
+nodes with a compact step summary, and cross-boundary edges: field formula
+references, Field→Object ``BELONGS_TO``, Flow→Apex/Flow ``INVOKES``, and
+Flow→Object ``REFERENCES``.
+
+Note: the node kind is ``SalesforceFlow``, not ``Flow`` — this codebase
+already uses "flow" for a derived concept (execution paths through the call
+graph; see ``flows.py`` / ``get_flow_tool``), unrelated to Salesforce's
+declarative Flow automation metadata.
 """
 
 from __future__ import annotations
@@ -24,7 +31,21 @@ logger = logging.getLogger(__name__)
 _SF_NS = "http://soap.sforce.com/2006/04/metadata"
 _FIELD_REF_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*__(?:c|r))\b")
 
-DEFAULT_METADATA_PATHS = ("force-app/main/default/objects",)
+# The whole package directory, not just "objects/" — *.flow-meta.xml lives
+# under a sibling "flows/" folder, and rglob recurses either way.
+DEFAULT_METADATA_PATHS = ("force-app",)
+
+_OBJECT_STUB_FILE = "salesforce_metadata://Object"
+
+# Flow elements that represent a step in the flow's control graph (each has
+# a <name> and, per the one-node-per-file design, contribute to the compact
+# extra["steps"] summary rather than becoming their own graph nodes).
+_FLOW_STEP_TAGS = frozenset({
+    "actionCalls", "assignments", "collectionProcessors", "decisions",
+    "loops", "orchestratedStages", "recordCreates", "recordDeletes",
+    "recordLookups", "recordRollbacks", "recordUpdates", "screens",
+    "subflows", "waits", "apexPluginCalls",
+})
 
 
 def _package_directories(repo_root: Path) -> list[str]:
@@ -81,6 +102,13 @@ def _load_metadata_config(repo_root: Path) -> Optional[dict]:
 
 def _local(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _child_text(elem: ET.Element, tag: str) -> Optional[str]:
+    for child in elem:
+        if _local(child.tag) == tag and child.text:
+            return child.text.strip()
+    return None
 
 
 def _parse_field_meta(path: Path) -> Optional[dict]:
@@ -150,32 +178,150 @@ def _field_refs(formula: str) -> set[str]:
     return set(_FIELD_REF_RE.findall(formula))
 
 
-def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
-    """Index Salesforce field metadata into the graph store."""
-    config = _load_metadata_config(repo_root)
-    if not config:
-        return {"fields_indexed": 0, "references_created": 0, "references_unresolved": 0}
+def _object_qualified_name(object_name: str) -> str:
+    return f"{_OBJECT_STUB_FILE}::{object_name}"
 
-    paths = config.get("paths") or list(DEFAULT_METADATA_PATHS)
-    include_formulas = config.get("include_formulas", True)
 
-    # Pass 1: parse every field first so cross-field/cross-object lookups
-    # (relationship traversal, sibling-field formula refs) can resolve
-    # regardless of file discovery order.
-    parsed: list[dict] = []
-    seen_meta_paths: set[str] = set()
+def _upsert_object_stub(store: GraphStore, object_name: str, seen: set[str]) -> str:
+    """Ensure a minimal ``Object`` node exists for *object_name* and return its qn.
+
+    Full ``.object-meta.xml`` parsing (sharing model, label, etc.) is future
+    work — this only guarantees Field/Flow references to an object never
+    dangle. That matters even for objects with no local ``.object-meta.xml``
+    at all: extending a managed package's object (adding a custom field or
+    a flow that queries it) intentionally does not redeclare the package's
+    own object metadata locally, since that would drift from and conflict
+    with the installed package version.
+    """
+    qn = _object_qualified_name(object_name)
+    if object_name not in seen:
+        seen.add(object_name)
+        store.upsert_node(
+            NodeInfo(
+                kind="Object",
+                name=object_name,
+                file_path=_OBJECT_STUB_FILE,
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra={"metadata_type": "Object", "synthesized": True},
+            )
+        )
+    return qn
+
+
+def _target_references(elem: ET.Element) -> list[str]:
+    refs: list[str] = []
+    for sub in elem.iter():
+        if _local(sub.tag) == "targetReference" and sub.text:
+            ref = sub.text.strip()
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _parse_flow_meta(path: Path) -> Optional[dict]:
+    if not path.name.endswith(".flow-meta.xml"):
+        return None
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError as exc:
+        logger.warning("Malformed flow metadata %s: %s", path, exc)
+        return None
+
+    root = tree.getroot()
+    name = path.name[: -len(".flow-meta.xml")]
+
+    process_type = None
+    status = None
+    trigger_object = None
+    trigger_type = None
+    record_trigger_type = None
+    steps: list[dict] = []
+    action_apex_refs: list[str] = []
+    subflow_refs: list[str] = []
+    object_refs: set[str] = set()
+
+    for child in root:
+        tag = _local(child.tag)
+        if tag == "processType" and child.text:
+            process_type = child.text.strip()
+        elif tag == "status" and child.text:
+            status = child.text.strip()
+        elif tag == "start":
+            trigger_object = _child_text(child, "object")
+            trigger_type = _child_text(child, "triggerType")
+            record_trigger_type = _child_text(child, "recordTriggerType")
+            if trigger_object:
+                object_refs.add(trigger_object)
+            steps.append({
+                "name": "start",
+                "type": "start",
+                "connects_to": _target_references(child),
+            })
+        elif tag in _FLOW_STEP_TAGS:
+            step_name = _child_text(child, "name") or tag
+            step: dict = {
+                "name": step_name,
+                "type": tag,
+                "connects_to": _target_references(child),
+            }
+            obj = _child_text(child, "object")
+            if obj:
+                step["object"] = obj
+                object_refs.add(obj)
+            if tag == "actionCalls":
+                action_type = _child_text(child, "actionType")
+                action_name = _child_text(child, "actionName")
+                if action_name and (action_type or "").lower() == "apex":
+                    action_apex_refs.append(action_name)
+                    step["action_name"] = action_name
+                    step["action_type"] = action_type
+            elif tag == "subflows":
+                flow_name = _child_text(child, "flowName")
+                if flow_name:
+                    subflow_refs.append(flow_name)
+                    step["flow_name"] = flow_name
+            steps.append(step)
+
+    return {
+        "name": name,
+        "file_path": str(path),
+        "process_type": process_type,
+        "status": status,
+        "trigger_object": trigger_object,
+        "trigger_type": trigger_type,
+        "record_trigger_type": record_trigger_type,
+        "steps": steps,
+        "action_apex_refs": action_apex_refs,
+        "subflow_refs": subflow_refs,
+        "object_refs": sorted(object_refs),
+    }
+
+
+def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
+    seen: set[str] = set()
+    found: list[Path] = []
     for rel in paths:
         base = repo_root / rel
         if not base.is_dir():
             continue
-        for meta_path in base.rglob("*.field-meta.xml"):
+        for meta_path in base.rglob(pattern):
             key = str(meta_path)
-            if key in seen_meta_paths:
+            if key in seen:
                 continue
-            seen_meta_paths.add(key)
-            info = _parse_field_meta(meta_path)
-            if info:
-                parsed.append(info)
+            seen.add(key)
+            found.append(meta_path)
+    return found
+
+
+def _index_fields(
+    store: GraphStore,
+    field_files: list[Path],
+    include_formulas: bool,
+    object_stub_seen: set[str],
+) -> dict:
+    parsed = [info for info in (_parse_field_meta(p) for p in field_files) if info]
 
     # name -> qualified name, preferring the same parent object on lookup.
     field_qn_by_object: dict[tuple[Optional[str], str], str] = {}
@@ -222,6 +368,19 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         )
         fields_indexed += 1
 
+        if parent_name:
+            object_qn = _upsert_object_stub(store, parent_name, object_stub_seen)
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="BELONGS_TO",
+                    source=field_qn,
+                    target=object_qn,
+                    file_path=info["file_path"],
+                    line=1,
+                    extra={},
+                )
+            )
+
         if not info.get("formula"):
             continue
 
@@ -255,17 +414,157 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
             )
             references_created += 1
 
-    if fields_indexed:
-        store.commit()
-
-    logger.info(
-        "Metadata indexer: %d field(s), %d reference edge(s) (%d unresolved)",
-        fields_indexed,
-        references_created,
-        references_unresolved,
-    )
     return {
         "fields_indexed": fields_indexed,
         "references_created": references_created,
         "references_unresolved": references_unresolved,
+    }
+
+
+def _index_flows(
+    store: GraphStore,
+    flow_files: list[Path],
+    object_stub_seen: set[str],
+) -> dict:
+    parsed = [info for info in (_parse_flow_meta(p) for p in flow_files) if info]
+
+    flow_qn_by_name: dict[str, str] = {
+        info["name"]: f"{info['file_path']}::{info['name']}" for info in parsed
+    }
+    class_qn_by_name: dict[str, str] = {}
+    for row in store._conn.execute(
+        "SELECT name, qualified_name FROM nodes WHERE kind = 'Class' AND language = 'apex'"
+    ).fetchall():
+        # Prefer the shortest qualified name on a name collision (matches
+        # apex_static_resolver's convention for the same ambiguity).
+        bare = row["name"]
+        qual = row["qualified_name"]
+        if bare not in class_qn_by_name or len(qual) < len(class_qn_by_name[bare]):
+            class_qn_by_name[bare] = qual
+
+    flows_indexed = 0
+    invokes_created = 0
+    invokes_unresolved = 0
+    references_created = 0
+
+    for info in parsed:
+        flow_qn = flow_qn_by_name[info["name"]]
+        extra: dict = {
+            "metadata_type": "Flow",
+            "steps": info["steps"],
+            "step_count": len(info["steps"]),
+        }
+        if info.get("process_type"):
+            extra["process_type"] = info["process_type"]
+        if info.get("status"):
+            extra["status"] = info["status"]
+        if info.get("trigger_object"):
+            extra["trigger_object"] = info["trigger_object"]
+        if info.get("trigger_type"):
+            extra["trigger_type"] = info["trigger_type"]
+        if info.get("record_trigger_type"):
+            extra["record_trigger_type"] = info["record_trigger_type"]
+
+        store.upsert_node(
+            NodeInfo(
+                kind="SalesforceFlow",
+                name=info["name"],
+                file_path=info["file_path"],
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra=extra,
+            )
+        )
+        flows_indexed += 1
+
+        for action_name in info["action_apex_refs"]:
+            target_qn = class_qn_by_name.get(action_name)
+            edge_extra: dict = {"via": "actionCalls"}
+            if target_qn:
+                target = target_qn
+            else:
+                target = action_name
+                edge_extra["unresolved_reference"] = True
+                invokes_unresolved += 1
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="INVOKES", source=flow_qn, target=target,
+                    file_path=info["file_path"], line=1, extra=edge_extra,
+                )
+            )
+            invokes_created += 1
+
+        for flow_name in info["subflow_refs"]:
+            target_qn = flow_qn_by_name.get(flow_name)
+            edge_extra = {"via": "subflows"}
+            if target_qn:
+                target = target_qn
+            else:
+                target = flow_name
+                edge_extra["unresolved_reference"] = True
+                invokes_unresolved += 1
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="INVOKES", source=flow_qn, target=target,
+                    file_path=info["file_path"], line=1, extra=edge_extra,
+                )
+            )
+            invokes_created += 1
+
+        for object_name in info["object_refs"]:
+            object_qn = _upsert_object_stub(store, object_name, object_stub_seen)
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="REFERENCES", source=flow_qn, target=object_qn,
+                    file_path=info["file_path"], line=1, extra={},
+                )
+            )
+            references_created += 1
+
+    return {
+        "flows_indexed": flows_indexed,
+        "flow_invokes_created": invokes_created,
+        "flow_invokes_unresolved": invokes_unresolved,
+        "flow_references_created": references_created,
+    }
+
+
+def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
+    """Index Salesforce field and Flow metadata into the graph store."""
+    empty = {
+        "fields_indexed": 0, "references_created": 0, "references_unresolved": 0,
+        "flows_indexed": 0, "flow_invokes_created": 0, "flow_invokes_unresolved": 0,
+        "flow_references_created": 0, "objects_indexed": 0,
+    }
+    config = _load_metadata_config(repo_root)
+    if not config:
+        return empty
+
+    paths = config.get("paths") or list(DEFAULT_METADATA_PATHS)
+    include_formulas = config.get("include_formulas", True)
+    object_stub_seen: set[str] = set()
+
+    field_files = _discover(paths, repo_root, "*.field-meta.xml")
+    flow_files = _discover(paths, repo_root, "*.flow-meta.xml")
+
+    field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
+    flow_stats = _index_flows(store, flow_files, object_stub_seen)
+
+    if field_stats["fields_indexed"] or flow_stats["flows_indexed"]:
+        store.commit()
+
+    logger.info(
+        "Metadata indexer: %d field(s), %d flow(s), %d object stub(s), "
+        "%d field reference edge(s) (%d unresolved), "
+        "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
+        field_stats["fields_indexed"], flow_stats["flows_indexed"], len(object_stub_seen),
+        field_stats["references_created"], field_stats["references_unresolved"],
+        flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
+        flow_stats["flow_references_created"],
+    )
+    return {
+        **field_stats,
+        **flow_stats,
+        "objects_indexed": len(object_stub_seen),
     }
