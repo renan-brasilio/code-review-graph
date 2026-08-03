@@ -328,10 +328,43 @@ def _parse_custom_labels(path: Path) -> list[dict]:
     return labels
 
 
+def _remove_stale_labels_in_file(store: GraphStore, file_path: str, current_names: set[str]) -> int:
+    """Remove Label nodes whose entry is gone from *file_path*, which itself still exists.
+
+    Unlike fields/flows (one file per entry), all of an org's Custom Labels
+    live in one ``CustomLabels.labels-meta.xml`` bundle — removing a single
+    ``<labels>`` entry doesn't change the set of *files* on disk, so the
+    file-level stale check in ``index_salesforce_metadata`` never catches
+    it. This diffs at the entry level instead.
+    """
+    conn = store._conn
+    removed = 0
+    for row in conn.execute(
+        "SELECT qualified_name, name FROM nodes WHERE kind = 'Label' AND file_path = ?",
+        (file_path,),
+    ).fetchall():
+        if row["name"] in current_names:
+            continue
+        qn = row["qualified_name"]
+        conn.execute(
+            "DELETE FROM edges WHERE source_qualified = ? OR target_qualified = ?", (qn, qn),
+        )
+        conn.execute("DELETE FROM nodes WHERE qualified_name = ?", (qn,))
+        removed += 1
+    if removed:
+        store.commit()
+    return removed
+
+
 def _index_labels(store: GraphStore, label_files: list[Path]) -> dict:
     labels_indexed = 0
+    labels_removed = 0
     for path in label_files:
-        for info in _parse_custom_labels(path):
+        parsed = _parse_custom_labels(path)
+        labels_removed += _remove_stale_labels_in_file(
+            store, str(path), {info["name"] for info in parsed}
+        )
+        for info in parsed:
             extra: dict = {"metadata_type": "CustomLabel"}
             if info.get("value"):
                 extra["value"] = info["value"]
@@ -351,7 +384,7 @@ def _index_labels(store: GraphStore, label_files: list[Path]) -> dict:
                 )
             )
             labels_indexed += 1
-    return {"labels_indexed": labels_indexed}
+    return {"labels_indexed": labels_indexed, "labels_removed": labels_removed}
 
 
 def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
@@ -615,7 +648,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         "fields_indexed": 0, "references_created": 0, "references_unresolved": 0,
         "flows_indexed": 0, "flow_invokes_created": 0, "flow_invokes_unresolved": 0,
         "flow_references_created": 0, "objects_indexed": 0, "labels_indexed": 0,
-        "stale_metadata_files_removed": 0,
+        "labels_removed": 0, "stale_metadata_files_removed": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -645,10 +678,11 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
 
     logger.info(
         "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object stub(s), "
-        "%d stale file(s) removed, %d field reference edge(s) (%d unresolved), "
+        "%d stale file(s) removed, %d stale label(s) removed, "
+        "%d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
         field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
-        len(object_stub_seen), stale_removed,
+        len(object_stub_seen), stale_removed, label_stats["labels_removed"],
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],

@@ -68,6 +68,12 @@
   indexed file paths and removes anything no longer present.
   `code-review-graph update` was unaffected (its git-diff-based change
   detection already covered deletions).
+- Fixed the same class of phantom-node bug specifically for Custom Labels:
+  unlike fields/flows (one file per entry), every label in an org lives in
+  a single bundled `CustomLabels.labels-meta.xml` — removing one `<labels>`
+  entry doesn't change which *files* exist, so the file-level fix above
+  didn't catch it (verified this separately before fixing). Label indexing
+  now also diffs at the entry level within an unchanged file.
 - Fixed a `bandit` CI failure introduced by the Salesforce metadata work:
   `xml.etree.ElementTree` usage in `metadata_indexer.py` (B405/B314 — flagged
   as unsafe for untrusted XML, but these are local repo metadata files, same

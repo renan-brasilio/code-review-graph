@@ -301,3 +301,44 @@ class TestStaleMetadataFileCleanup:
         }
         assert remaining == {"Record_Identifier_Key__c", "Sample_Record_Link_Template__c"}
         store.close()
+
+    def test_removed_label_entry_is_cleaned_up_even_though_the_file_survives(self, tmp_path):
+        """All of an org's Custom Labels live in one bundled file, unlike the
+        one-file-per-entry convention fields/flows use — removing a single
+        <labels> entry doesn't change the file-level discovery scan at all,
+        so this needs its own diff, separate from stale_metadata_files_removed."""
+        labels_dir = tmp_path / "force-app" / "main" / "default" / "labels"
+        labels_dir.mkdir(parents=True)
+        labels_file = labels_dir / "CustomLabels.labels-meta.xml"
+        labels_file.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+            "    <labels><fullName>Label_A</fullName><value>A</value></labels>\n"
+            "    <labels><fullName>Label_B</fullName><value>B</value></labels>\n"
+            "</CustomLabels>\n",
+            encoding="utf-8",
+        )
+
+        store = GraphStore(get_db_path(tmp_path))
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["labels_indexed"] == 2
+        assert stats["labels_removed"] == 0
+
+        labels_file.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+            "    <labels><fullName>Label_A</fullName><value>A</value></labels>\n"
+            "</CustomLabels>\n",
+            encoding="utf-8",
+        )
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["labels_indexed"] == 1
+        assert stats["labels_removed"] == 1
+        assert stats["stale_metadata_files_removed"] == 0  # the file itself never disappeared
+
+        remaining = {
+            row["name"]
+            for row in store._conn.execute("SELECT name FROM nodes WHERE kind='Label'").fetchall()
+        }
+        assert remaining == {"Label_A"}
+        store.close()
