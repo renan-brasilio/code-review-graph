@@ -677,6 +677,116 @@ def _index_permission_sets(
     }
 
 
+def _parse_layout_meta(path: Path) -> Optional[dict]:
+    """Parse a ``*.layout-meta.xml``.
+
+    Layouts have no ``<object>`` element — the object API name is only
+    encoded in the filename convention ``ObjectApiName-Layout Label``.
+    Splitting on the first ``-`` is safe: Salesforce object API names
+    cannot contain one.
+    """
+    if not path.name.endswith(".layout-meta.xml"):
+        return None
+    try:
+        tree = ET.parse(path)  # nosec B314 - local repo file, not untrusted network XML
+    except ET.ParseError as exc:
+        logger.warning("Malformed layout metadata %s: %s", path, exc)
+        return None
+
+    stem = path.name[: -len(".layout-meta.xml")]
+    object_name, _, layout_label = stem.partition("-")
+    if not object_name:
+        return None
+
+    field_names: list[str] = []
+    for elem in tree.getroot().iter():
+        if _local(elem.tag) == "field" and elem.text:
+            field_name = elem.text.strip()
+            if field_name not in field_names:
+                field_names.append(field_name)
+
+    return {
+        "name": stem,
+        "file_path": str(path),
+        "object_name": object_name,
+        "layout_label": layout_label,
+        "field_names": field_names,
+    }
+
+
+def _index_layouts(
+    store: GraphStore, layout_files: list[Path], object_stub_seen: set[str],
+) -> dict:
+    parsed = [info for info in (_parse_layout_meta(p) for p in layout_files) if info]
+
+    field_qual: dict[tuple[str, str], str] = {}
+    for row in store._conn.execute(
+        "SELECT name, qualified_name, parent_name FROM nodes "
+        "WHERE kind = 'Field' AND language = 'salesforce_metadata'"
+    ).fetchall():
+        field_qual[(row["parent_name"], row["name"])] = row["qualified_name"]
+
+    layouts_indexed = 0
+    references_created = 0
+    references_unresolved = 0
+
+    for info in parsed:
+        layout_qn = f"{info['file_path']}::{info['name']}"
+        extra: dict = {
+            "metadata_type": "Layout",
+            "object_name": info["object_name"],
+            "field_count": len(info["field_names"]),
+        }
+        if info.get("layout_label"):
+            extra["layout_label"] = info["layout_label"]
+        store.upsert_node(
+            NodeInfo(
+                kind="Layout",
+                name=info["name"],
+                file_path=info["file_path"],
+                line_start=1,
+                line_end=1,
+                language="salesforce_metadata",
+                extra=extra,
+            )
+        )
+        layouts_indexed += 1
+
+        object_qn = _upsert_object_stub(store, info["object_name"], object_stub_seen)
+        store.upsert_edge(
+            EdgeInfo(
+                kind="REFERENCES", source=layout_qn, target=object_qn,
+                file_path=info["file_path"], line=1, extra={"via": "layout_object"},
+            )
+        )
+        references_created += 1
+
+        for field_name in info["field_names"]:
+            target_qn = field_qual.get((info["object_name"], field_name))
+            edge_extra: dict = {"via": "layoutItems"}
+            if target_qn:
+                target = target_qn
+            else:
+                # Standard fields (Name, OwnerId, ...) are never indexed —
+                # same documented limitation as formula field references.
+                target = f"{info['object_name']}.{field_name}"
+                edge_extra["unresolved_reference"] = True
+                references_unresolved += 1
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="REFERENCES", source=layout_qn, target=target,
+                    file_path=info["file_path"], line=1, extra=edge_extra,
+                )
+            )
+            references_created += 1
+
+    return {
+        "layouts_indexed": layouts_indexed,
+        "layout_references_created": references_created,
+        "layout_references_unresolved": references_unresolved,
+    }
+
+
 def _discover(paths: list[str], repo_root: Path, pattern: str) -> list[Path]:
     seen: set[str] = set()
     found: list[Path] = []
@@ -700,14 +810,14 @@ def _remove_stale_metadata_files(store: GraphStore, current_paths: set[str]) -> 
     stale-file reconciliation in ``incremental.py`` (gated on
     ``parser.detect_language()``) never sees these files — a deleted
     ``*.field-meta.xml``/``*.flow-meta.xml``/``CustomLabels.labels-meta.xml``/
-    ``*.permissionset-meta.xml`` would otherwise leave a permanent phantom
-    node behind on every subsequent full ``build``.
+    ``*.permissionset-meta.xml``/``*.layout-meta.xml`` would otherwise leave
+    a permanent phantom node behind on every subsequent full ``build``.
     """
     stored_paths = {
         row["file_path"]
         for row in store._conn.execute(
             "SELECT DISTINCT file_path FROM nodes "
-            "WHERE kind IN ('Field', 'SalesforceFlow', 'Label', 'PermissionSet')"
+            "WHERE kind IN ('Field', 'SalesforceFlow', 'Label', 'PermissionSet', 'Layout')"
         ).fetchall()
     }
     stale = stored_paths - current_paths
@@ -941,6 +1051,8 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         "labels_removed": 0, "stale_metadata_files_removed": 0,
         "real_objects_indexed": 0, "objects_downgraded": 0,
         "permission_sets_indexed": 0, "grants_created": 0, "grants_unresolved": 0,
+        "layouts_indexed": 0, "layout_references_created": 0,
+        "layout_references_unresolved": 0,
     }
     config = _load_metadata_config(repo_root)
     if not config:
@@ -954,17 +1066,21 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     label_files = _discover(paths, repo_root, "CustomLabels.labels-meta.xml")
     object_files = _discover(paths, repo_root, "*.object-meta.xml")
     permission_set_files = _discover(paths, repo_root, "*.permissionset-meta.xml")
+    layout_files = _discover(paths, repo_root, "*.layout-meta.xml")
 
     current_paths = {
-        str(p) for p in (*field_files, *flow_files, *label_files, *permission_set_files)
+        str(p) for p in (
+            *field_files, *flow_files, *label_files,
+            *permission_set_files, *layout_files,
+        )
     }
     stale_removed = _remove_stale_metadata_files(store, current_paths)
 
     # Objects first: real .object-meta.xml (including CMT type definitions,
-    # same format) must land before Field/Flow/PermissionSet indexing so
-    # their stub fallback doesn't clobber real data — object_stub_seen
-    # pre-seeded with real names is what makes _upsert_object_stub a no-op
-    # for them.
+    # same format) must land before Field/Flow/PermissionSet/Layout
+    # indexing so their stub fallback doesn't clobber real data —
+    # object_stub_seen pre-seeded with real names is what makes
+    # _upsert_object_stub a no-op for them.
     real_object_stats, real_object_names = _index_objects(store, object_files)
     objects_downgraded = _downgrade_stale_real_objects(store, real_object_names)
     object_stub_seen: set[str] = set(real_object_names)
@@ -972,14 +1088,16 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     field_stats = _index_fields(store, field_files, include_formulas, object_stub_seen)
     flow_stats = _index_flows(store, flow_files, object_stub_seen)
     label_stats = _index_labels(store, label_files)
-    # After fields: permission set fieldPermissions resolve against Field
-    # nodes, which only exist once _index_fields has run.
+    # After fields: permission set / layout field references resolve
+    # against Field nodes, which only exist once _index_fields has run.
     ps_stats = _index_permission_sets(store, permission_set_files, object_stub_seen)
+    layout_stats = _index_layouts(store, layout_files, object_stub_seen)
 
     any_indexed = (
         field_stats["fields_indexed"] or flow_stats["flows_indexed"]
         or label_stats["labels_indexed"] or real_object_stats["objects_indexed"]
         or objects_downgraded or ps_stats["permission_sets_indexed"]
+        or layout_stats["layouts_indexed"]
     )
     if any_indexed:
         store.commit()
@@ -987,13 +1105,16 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
     logger.info(
         "Metadata indexer: %d field(s), %d flow(s), %d label(s), %d object(s) "
         "(%d real, %d downgraded), %d permission set(s) (%d grant(s), %d unresolved), "
+        "%d layout(s) (%d reference(s), %d unresolved), "
         "%d stale file(s) removed, %d stale label(s) removed, "
         "%d field reference edge(s) (%d unresolved), "
         "%d flow invoke edge(s) (%d unresolved), %d flow reference edge(s)",
         field_stats["fields_indexed"], flow_stats["flows_indexed"], label_stats["labels_indexed"],
         len(object_stub_seen), real_object_stats["objects_indexed"], objects_downgraded,
         ps_stats["permission_sets_indexed"], ps_stats["grants_created"],
-        ps_stats["grants_unresolved"], stale_removed, label_stats["labels_removed"],
+        ps_stats["grants_unresolved"], layout_stats["layouts_indexed"],
+        layout_stats["layout_references_created"], layout_stats["layout_references_unresolved"],
+        stale_removed, label_stats["labels_removed"],
         field_stats["references_created"], field_stats["references_unresolved"],
         flow_stats["flow_invokes_created"], flow_stats["flow_invokes_unresolved"],
         flow_stats["flow_references_created"],
@@ -1003,6 +1124,7 @@ def index_salesforce_metadata(store: GraphStore, repo_root: Path) -> dict:
         **flow_stats,
         **label_stats,
         **ps_stats,
+        **layout_stats,
         "objects_indexed": len(object_stub_seen),
         "real_objects_indexed": real_object_stats["objects_indexed"],
         "objects_downgraded": objects_downgraded,

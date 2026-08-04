@@ -93,6 +93,7 @@ include_formulas = true
 | `apex_label_resolver` | `Label.X` field access in Apex `.cls`/`.trigger` | `REFERENCES` edge to the `Label` node, scoped to the enclosing method when one contains the reference |
 | `metadata_indexer` | `objects/X/X.object-meta.xml` | Upgrades the `Object` node from stub to real (label, description, sharing model, `is_custom_metadata_type`) |
 | `metadata_indexer` | `permissionsets/X.permissionset-meta.xml` | `PermissionSet` node + `GRANTS` edges to Apex classes (enabled `classAccesses`), Fields (`fieldPermissions` with read or edit), and Objects (`objectPermissions` with any permission) |
+| `metadata_indexer` | `layouts/Object-Layout Name.layout-meta.xml` | `Layout` node + `REFERENCES` edges to the Object and every Field on it |
 
 `Object` nodes are stubs (name only) unless/until real `.object-meta.xml` is
 found — this deliberately still covers objects with no local object
@@ -138,7 +139,10 @@ Uses the sample trigger/handler fixture under `tests/fixtures/apex/acceptance_pa
 - Flow XML indexing is one node per flow — the internal step sequence is
   a compact summary in `extra["steps"]`, not a fully exploded per-element
   graph. Decision branch logic (which rule leads where) isn't distinguished.
-- No Profiles or Layouts yet (Permission Sets are covered)
+- No Profiles yet (Permission Sets and Layouts are covered)
+- Layout field references to standard fields (`Name`, `OwnerId`, ...) are
+  unresolved, not linked — same limitation as formula field references,
+  since standard fields are never indexed
 - No CMT *records* (only type definitions — see above)
 - LWC/Aura resolution covers the standard `import x from '@salesforce/apex/...'`
   / `'@salesforce/schema/...'` default-import form only (the only form

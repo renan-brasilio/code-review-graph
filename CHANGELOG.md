@@ -58,6 +58,11 @@
   targets are flagged, not silently dropped. Profiles use the identical
   `classAccesses`/`fieldPermissions`/`objectPermissions` shape but aren't
   indexed yet.
+- **Layout indexing**: `layouts/Object-Layout Name.layout-meta.xml` →
+  `Layout` node + `REFERENCES` edges to the Object and every Field placed
+  on it. Layouts have no `<object>` element in the XML — the object API
+  name is parsed from the filename convention instead (splitting on the
+  first `-`, which Salesforce object API names can never contain).
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each

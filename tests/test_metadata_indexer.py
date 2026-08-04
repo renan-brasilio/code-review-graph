@@ -617,3 +617,106 @@ class TestPermissionSetIndexing:
             "SELECT 1 FROM nodes WHERE kind='PermissionSet'"
         ).fetchone() is None
         store.close()
+
+
+LAYOUT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Layout xmlns="http://soap.sforce.com/2006/04/metadata">
+    <layoutSections>
+        <label>Information</label>
+        <layoutColumns>
+            <layoutItems>
+                <behavior>Edit</behavior>
+                <field>Name</field>
+            </layoutItems>
+            <layoutItems>
+                <behavior>Edit</behavior>
+                <field>Record_Identifier_Key__c</field>
+            </layoutItems>
+        </layoutColumns>
+        <layoutColumns>
+            <layoutItems>
+                <behavior>Edit</behavior>
+                <field>Nonexistent_Field__c</field>
+            </layoutItems>
+        </layoutColumns>
+    </layoutSections>
+</Layout>
+"""
+
+
+class TestLayoutIndexing:
+    def _build_fixture(self, tmp_path: Path):
+        objects_dir = tmp_path / "force-app" / "main" / "default" / "objects"
+        objects_dir.mkdir(parents=True)
+        _copy_object("Sample_Record_Link__c", objects_dir)
+
+        layouts_dir = tmp_path / "force-app" / "main" / "default" / "layouts"
+        layouts_dir.mkdir(parents=True)
+        layout_file = layouts_dir / "Sample_Record_Link__c-Sample Record Link Layout.layout-meta.xml"
+        layout_file.write_text(LAYOUT_XML, encoding="utf-8")
+
+        store = GraphStore(get_db_path(tmp_path))
+        return store, layout_file
+
+    def test_object_name_parsed_from_filename_convention(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["layouts_indexed"] == 1
+
+        row = store._conn.execute(
+            "SELECT extra FROM nodes WHERE kind='Layout'"
+        ).fetchone()
+        assert '"object_name": "Sample_Record_Link__c"' in row["extra"]
+        assert "Sample Record Link Layout" in row["extra"]
+        store.close()
+
+    def test_layout_references_object_and_resolves_known_field(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        index_salesforce_metadata(store, tmp_path)
+
+        layout_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Layout'"
+        ).fetchone()["qualified_name"]
+        object_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Object' "
+            "AND name='Sample_Record_Link__c'"
+        ).fetchone()["qualified_name"]
+        field_qn = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind='Field' "
+            "AND name='Record_Identifier_Key__c'"
+        ).fetchone()["qualified_name"]
+
+        edges = store._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind='REFERENCES' AND source_qualified=?",
+            (layout_qn,),
+        ).fetchall()
+        targets = {row["target_qualified"] for row in edges}
+        assert object_qn in targets
+        assert field_qn in targets
+        store.close()
+
+    def test_standard_and_missing_fields_are_unresolved_not_dropped(self, tmp_path):
+        store, _ = self._build_fixture(tmp_path)
+        stats = index_salesforce_metadata(store, tmp_path)
+        # "Name" (standard field, never indexed) + "Nonexistent_Field__c" = 2 unresolved.
+        assert stats["layout_references_unresolved"] == 2
+
+        unresolved = store._conn.execute(
+            "SELECT target_qualified FROM edges WHERE kind='REFERENCES' "
+            "AND extra LIKE '%unresolved_reference%'"
+        ).fetchall()
+        targets = {row["target_qualified"] for row in unresolved}
+        assert "Sample_Record_Link__c.Name" in targets
+        assert "Sample_Record_Link__c.Nonexistent_Field__c" in targets
+        store.close()
+
+    def test_deleted_layout_file_is_removed_on_next_index_run(self, tmp_path):
+        store, layout_file = self._build_fixture(tmp_path)
+        index_salesforce_metadata(store, tmp_path)
+        assert store._conn.execute("SELECT 1 FROM nodes WHERE kind='Layout'").fetchone()
+
+        layout_file.unlink()
+        stats = index_salesforce_metadata(store, tmp_path)
+        assert stats["stale_metadata_files_removed"] == 1
+        assert store._conn.execute("SELECT 1 FROM nodes WHERE kind='Layout'").fetchone() is None
+        store.close()
