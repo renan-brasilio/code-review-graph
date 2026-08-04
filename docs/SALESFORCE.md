@@ -88,12 +88,19 @@ include_formulas = true
 | `apex_trigger_resolver` | `createAndExecuteHandler(Handler.class)` in triggers | `INVOKES` edge to handler class |
 | `metadata_indexer` | `*.field-meta.xml` | `Field` nodes (type, relationship, formula in `extra`) + resolved `REFERENCES` edges for formula field/relationship traversal + `BELONGS_TO` edge to an `Object` node |
 | `metadata_indexer` | `*.flow-meta.xml` | `SalesforceFlow` node (process type, trigger, step summary in `extra`) + `INVOKES` edges to Apex classes (`actionCalls`) and subflows + `REFERENCES` edges to objects touched |
-| `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` / `@salesforce/label/c.LabelName` imports in LWC/Aura `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field / Label node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
+| `lwc_apex_resolver` | `@salesforce/apex/Class.method` / `@salesforce/schema/Object.Field` / `@salesforce/label/c.LabelName` imports in LWC `.js`/`.ts` | Rewrites the bare-string `IMPORTS_FROM` target to the real Apex method / Field / Label node, and resolves same-file `CALLS`/`REFERENCES` edges on the imported local name (both `@wire` and imperative usage) |
 | `metadata_indexer` | `labels/CustomLabels.labels-meta.xml` | `Label` node per entry (value, categories, short description in `extra`) |
 | `apex_label_resolver` | `Label.X` field access in Apex `.cls`/`.trigger` | `REFERENCES` edge to the `Label` node, scoped to the enclosing method when one contains the reference |
 | `metadata_indexer` | `objects/X/X.object-meta.xml` | Upgrades the `Object` node from stub to real (label, description, sharing model, `is_custom_metadata_type`) |
 | `metadata_indexer` | `permissionsets/X.permissionset-meta.xml` | `PermissionSet` node + `GRANTS` edges to Apex classes (enabled `classAccesses`), Fields (`fieldPermissions` with read or edit), and Objects (`objectPermissions` with any permission) |
 | `metadata_indexer` | `layouts/Object-Layout Name.layout-meta.xml` | `Layout` node + `REFERENCES` edges to the Object and every Field on it |
+| `aura_apex_resolver` | Aura `.cmp`/`.app` `controller` attribute + sibling `.js` `component.get("c.method")` calls | `AuraComponent` node + `INVOKES` edge to the resolved Apex method |
+
+Aura wires to Apex completely differently from LWC: the bundle's root tag
+names exactly one Apex class as `controller`, and the JS controller/helper
+files dispatch server actions by *string* name
+(`component.get("c.methodName")`) rather than an ES6 import — so it needed
+its own resolver, not an extension of `lwc_apex_resolver`.
 
 `Object` nodes are stubs (name only) unless/until real `.object-meta.xml` is
 found — this deliberately still covers objects with no local object
@@ -144,9 +151,14 @@ Uses the sample trigger/handler fixture under `tests/fixtures/apex/acceptance_pa
   unresolved, not linked — same limitation as formula field references,
   since standard fields are never indexed
 - No CMT *records* (only type definitions — see above)
-- LWC/Aura resolution covers the standard `import x from '@salesforce/apex/...'`
-  / `'@salesforce/schema/...'` default-import form only (the only form
-  Salesforce's own framework allows for these two module families)
+- LWC resolution covers the standard `import x from '@salesforce/apex/...'`
+  / `'@salesforce/schema/...'` / `'@salesforce/label/...'` default-import
+  form only (the only form Salesforce's own framework allows for these
+  module families)
+- Aura resolution requires a literal `controller="ClassName"` attribute on
+  the `.cmp`/`.app` root tag and a literal `component.get("c.method")`
+  string in a sibling `.js` file — dynamically constructed action names
+  (built from a variable rather than a string literal) aren't resolved
 - `Object` nodes are stubs (name only) until real `.object-meta.xml`
   parsing is added
 - No cross-org / deployed metadata

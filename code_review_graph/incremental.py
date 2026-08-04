@@ -204,6 +204,16 @@ def _run_apex_label_resolver(store: GraphStore) -> Optional[dict]:
         logger.warning("Apex label resolver failed: %s", exc)
         return None
 
+
+def _run_aura_apex_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
+    """Index Aura components and resolve controller action calls. Stats or None on error."""
+    try:
+        from .aura_apex_resolver import resolve_aura_apex_wiring
+        return resolve_aura_apex_wiring(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Aura/Apex resolver failed: %s", exc)
+        return None
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
@@ -1220,6 +1230,7 @@ def full_build(
     metadata_stats = _run_metadata_indexer(store, repo_root)
     lwc_apex_stats = _run_lwc_apex_resolver(store)
     apex_label_stats = _run_apex_label_resolver(store)
+    aura_apex_stats = _run_aura_apex_resolver(store, repo_root)
 
     return {
         "files_parsed": len(files),
@@ -1237,6 +1248,7 @@ def full_build(
         "apex_static_resolution": apex_static_stats,
         "lwc_apex_resolution": lwc_apex_stats,
         "apex_label_resolution": apex_label_stats,
+        "aura_apex_resolution": aura_apex_stats,
         "apex_trigger_resolution": apex_trigger_stats,
         "metadata_indexing": metadata_stats,
     }
@@ -1425,7 +1437,10 @@ def incremental_update(
     apex_trigger_stats = _run_apex_trigger_resolver(store) if apex_changed else None
 
     metadata_changed = any(
-        rp.endswith((".field-meta.xml", ".flow-meta.xml", "CustomLabels.labels-meta.xml"))
+        rp.endswith((
+            ".field-meta.xml", ".flow-meta.xml", "CustomLabels.labels-meta.xml",
+            ".object-meta.xml", ".permissionset-meta.xml", ".layout-meta.xml",
+        ))
         for rp in all_files
     ) or apex_changed
     metadata_stats = (
@@ -1442,6 +1457,14 @@ def incremental_update(
     apex_label_changed = apex_changed or metadata_changed
     apex_label_stats = (
         _run_apex_label_resolver(store) if apex_label_changed else None
+    )
+
+    aura_changed = (
+        apex_changed
+        or any(rp.endswith((".cmp", ".app", ".js")) for rp in all_files)
+    )
+    aura_apex_stats = (
+        _run_aura_apex_resolver(store, repo_root) if aura_changed else None
     )
 
     return {
@@ -1464,6 +1487,7 @@ def incremental_update(
         "metadata_indexing": metadata_stats,
         "lwc_apex_resolution": lwc_apex_stats,
         "apex_label_resolution": apex_label_stats,
+        "aura_apex_resolution": aura_apex_stats,
     }
 
 

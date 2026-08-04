@@ -63,6 +63,23 @@
   on it. Layouts have no `<object>` element in the XML — the object API
   name is parsed from the filename convention instead (splitting on the
   first `-`, which Salesforce object API names can never contain).
+- **`aura_apex_resolver`** for Aura component → Apex controller wiring —
+  a completely different mechanism from LWC's ES6 imports, so it's its own
+  module rather than an extension of `lwc_apex_resolver`. Aura dispatches
+  server actions by string name at runtime
+  (`component.get("c.methodName")`), naming exactly one Apex class as the
+  bundle's `controller`; neither that markup attribute nor the string
+  dispatch is visible to the generic parser at all, so `callers_of` on an
+  Aura-invoked Apex method previously found nothing (confirmed with a
+  reproduction, same as the LWC case). New `AuraComponent` node kind, with
+  the same phantom-node stale-file cleanup the other metadata-XML-backed
+  kinds already have (`.cmp`/`.app` has no configured Tree-sitter
+  language either).
+- Fixed `code-review-graph update` not re-running metadata indexing for an
+  Object/Permission Set/Layout-only change — the file-extension gate was
+  never updated when those three were added, so only Field/Flow/Label
+  changes (or an accompanying Apex change) triggered a re-index; a full
+  `build` was the only way to pick them up otherwise.
 - Added a Voyage AI embedding provider (`--provider voyage`, key from
   `VOYAGE_API_KEY`, opt-in request throttling via
   `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
