@@ -268,6 +268,39 @@ kind: str | None
 limit: int = 20
 ```
 
+### Agent Memory Tools
+
+#### `save_memory_tool`
+```
+content: str
+scope: str = "repo"                  # "repo" or "global"
+category: str | None = None
+repo_root: str | None = None
+embed: bool = False                  # Opt-in vector similarity embedding
+```
+
+#### `recall_memories_tool`
+```
+query: str = ""                      # Text query; empty for recent
+scope: str = "both"                  # "repo", "global", or "both"
+limit: int = 10
+repo_root: str | None = None
+embed: bool = False                  # Rank by vector similarity
+```
+
+#### `list_memories_tool`
+```
+scope: str = "both"                  # "repo", "global", or "both"
+repo_root: str | None = None
+```
+
+#### `forget_memory_tool`
+```
+memory_id: int
+scope: str                           # "repo" or "global"
+repo_root: str | None = None
+```
+
 ## MCP Prompts (5 workflow templates)
 
 ### `review_changes`

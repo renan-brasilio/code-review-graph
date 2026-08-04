@@ -80,6 +80,14 @@ from .docs import embed_graph, generate_wiki_func, get_docs_section, get_wiki_pa
 
 # -- flows_tools ------------------------------------------------------------
 from .flows_tools import get_flow, list_flows
+
+# -- memory_tools -------------------------------------------------------------
+from .memory_tools import (
+    forget_memory_func,
+    list_memories_func,
+    recall_memories_func,
+    save_memory_func,
+)
 from .pipeline_trace import trace_pipeline
 
 # -- query ------------------------------------------------------------------
@@ -130,6 +138,11 @@ __all__ = [
     # flows_tools
     "get_flow",
     "list_flows",
+    # memory_tools
+    "forget_memory_func",
+    "list_memories_func",
+    "recall_memories_func",
+    "save_memory_func",
     # query
     "find_large_functions",
     "get_impact_radius",

@@ -37,6 +37,7 @@ from .tools import (
     embed_graph,
     find_large_functions,
     flag_flow_file_paths_covered,
+    forget_memory_func,
     generate_wiki_func,
     get_affected_flows_func,
     get_architecture_overview_func,
@@ -55,10 +56,13 @@ from .tools import (
     list_communities_func,
     list_flows,
     list_graph_stats,
+    list_memories_func,
     list_repos_func,
     query_graph,
+    recall_memories_func,
     refactor_func,
     run_postprocess,
+    save_memory_func,
     semantic_search_nodes,
     trace_pipeline,
     trace_symbol_context,
@@ -1047,6 +1051,91 @@ def cross_repo_search_tool(
         limit: Maximum results per repo. Default: 20.
     """
     return cross_repo_search_func(query=query, kind=kind, limit=limit)
+
+
+@mcp.tool()
+def save_memory_tool(
+    content: str,
+    scope: str = "repo",
+    category: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    embed: bool = False,
+) -> dict:
+    """Save a fact or preference for any MCP client to recall later.
+
+    Args:
+        content: The fact/preference to remember.
+        scope: "repo" (this project only, default) or "global" (every project).
+        category: Optional free-form label (e.g. "preference", "convention").
+        repo_root: Repository root path. Auto-detected if omitted.
+        embed: Compute a semantic embedding now so a later recall_memories
+            call with embed=True can rank this memory by similarity.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(save_memory_func(
+        content=content, scope=scope, category=category,
+        repo_root=root, embed=embed,
+    ), root)
+
+
+@mcp.tool()
+def recall_memories_tool(
+    query: str = "",
+    scope: str = "both",
+    limit: int = 10,
+    repo_root: Optional[str] = None,
+    embed: bool = False,
+) -> dict:
+    """Recall saved memories matching query across repo and/or global stores.
+
+    Args:
+        query: Text to match. Empty returns the most recently updated memories.
+        scope: "repo", "global", or "both" (default — checks both stores).
+        limit: Max memories to return. Default: 10.
+        repo_root: Repository root path. Auto-detected if omitted.
+        embed: Rank by semantic similarity instead of keyword substring match.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(recall_memories_func(
+        query=query, scope=scope, limit=limit,
+        repo_root=root, embed=embed,
+    ), root)
+
+
+@mcp.tool()
+def list_memories_tool(
+    scope: str = "both",
+    repo_root: Optional[str] = None,
+) -> dict:
+    """List every saved memory in scope, most recently updated first.
+
+    Args:
+        scope: "repo", "global", or "both" (default).
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(list_memories_func(
+        scope=scope, repo_root=root,
+    ), root)
+
+
+@mcp.tool()
+def forget_memory_tool(
+    memory_id: int,
+    scope: str,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Delete a saved memory by id.
+
+    Args:
+        memory_id: The memory's id (from a list/recall call).
+        scope: "repo" or "global" — must match the memory's scope.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(forget_memory_func(
+        memory_id=memory_id, scope=scope, repo_root=root,
+    ), root)
 
 
 @mcp.prompt()

@@ -3,7 +3,8 @@
 - [USAGE.md](USAGE.md) -- How to install and use
 - [FAQ.md](FAQ.md) -- How it compares to LSP, RAG, grep, and similar tools; when not to use it
 - [FEATURES.md](FEATURES.md) -- What's included, changelog
-- [COMMANDS.md](COMMANDS.md) -- All 30 MCP tools, 5 MCP prompts, skills, and CLI commands
+- [COMMANDS.md](COMMANDS.md) -- All 34 MCP tools, 5 MCP prompts, skills, and CLI commands
+- [MEMORY.md](MEMORY.md) -- Cross-tool persistent agent memory across MCP clients
 - [GITHUB_ACTION.md](GITHUB_ACTION.md) -- Risk-scored PR review comments via GitHub Actions
 - [CUSTOM_LANGUAGES.md](CUSTOM_LANGUAGES.md) -- Bring your own language via `.code-review-graph/languages.toml`
 - [LLM-OPTIMIZED-REFERENCE.md](../code_review_graph/docs/LLM-OPTIMIZED-REFERENCE.md) -- Token-optimized reference for MCP-capable AI coding agents

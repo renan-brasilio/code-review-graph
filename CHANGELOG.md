@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Cross-tool persistent agent memory**: exposed four new MCP tools
+  (`save_memory_tool`, `recall_memories_tool`, `list_memories_tool`,
+  `forget_memory_tool`) for persisting facts and user preferences across multiple
+  MCP clients (Cursor, Claude Code, etc.). Supports per-repo
+  (`<repo>/.code-review-graph/memory.db`) and global (`~/.code-review-graph/global_memory.db`)
+  SQLite stores, with opt-in semantic vector similarity (`embed=True`).
+  See `docs/MEMORY.md`.
 - **Salesforce / Apex enhancements**: static call resolution
   (`apex_static_resolver`), trigger → handler `INVOKES` edges
   (`apex_trigger_resolver`), parent-class `callers_of` fallback for method
