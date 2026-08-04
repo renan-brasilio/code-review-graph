@@ -35,13 +35,15 @@ code-review-graph embed --provider local   # or openai
 ```
 
 When `embeddings_count` is 0, `list_graph_stats` suggests running embed.
-`Field`/`SalesforceFlow`/`Object` nodes are embedded too — natural-language
-questions like "which field stores the acceptance status" work without
-knowing the exact API name.
+Every Salesforce metadata node kind (`Field`, `SalesforceFlow`, `Object`,
+`Label`, `PermissionSet`, `Layout`, `AuraComponent`) is embedded too —
+natural-language questions like "which field stores the acceptance status"
+work without knowing the exact API name.
 
-### 4. Optional: field formula metadata (Phase 6)
+### 4. Optional: metadata indexing configuration
 
-Metadata indexing runs automatically: it reads `packageDirectories` from
+Fields, Flows, Labels, Objects, Permission Sets, and Layouts are all
+indexed automatically: it reads `packageDirectories` from
 `sfdx-project.json` when present (so non-`force-app` package layouts are
 covered), falling back to `force-app/` if there's no `sfdx-project.json`.
 To override the search paths explicitly, create
@@ -50,9 +52,16 @@ To override the search paths explicitly, create
 ```toml
 [metadata]
 enabled = true
-paths = ["force-app/main/default/objects"]
+paths = ["force-app"]
 include_formulas = true
 ```
+
+Point `paths` at the package root, not a specific subfolder like
+`force-app/main/default/objects` — every metadata type is discovered by
+recursively scanning `paths`, so narrowing it to one subfolder silently
+excludes the metadata types that live elsewhere (Flows under `flows/`,
+Labels under `labels/`, Permission Sets under `permissionsets/`, and so
+on).
 
 ## Agent query recipes
 
@@ -65,7 +74,7 @@ include_formulas = true
 | Field formula lookup | `semantic_search_nodes` | Query field API name |
 | What Apex does a Salesforce Flow invoke? | `query_graph` | `callees_of` on the flow's qualified name, or filter `INVOKES` edges |
 | What object does a Flow act on? | `query_graph` | `REFERENCES` edges from the flow |
-| What LWC/Aura components call this Apex method? | `query_graph` | `callers_of` on the method — resolves `@salesforce/apex` imports automatically |
+| What LWC or Aura components call this Apex method? | `query_graph` | `callers_of` on the method — resolves `@salesforce/apex` LWC imports and Aura `component.get("c.method")` calls automatically |
 | What uses this Custom Label? | `query_graph` | `references_to` on the label name — covers both `Label.X` in Apex and `@salesforce/label/c.X` in LWC |
 
 **Tips:**
